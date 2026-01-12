@@ -24,6 +24,8 @@ dependencies = [
     "boto3>=1.28",
     "httpx>=0.25",
     "typing-extensions>=4.8; python_version < '3.12'",
+    "openai>=2.15.0",
+    "langgraph>=1.0.5",
 ]
 
 # uv dependency groups (PEP 735). This is what `uv sync --all-groups` installs.
@@ -34,6 +36,7 @@ dev = [
     "pytest>=7.4",
     # Dev-only install to silence IDE packaging warnings (build backend is still in [build-system])
     "hatchling>=1.25.0",
+    "python-dotenv>=1.2.1",
 ]
 
 [project.urls]

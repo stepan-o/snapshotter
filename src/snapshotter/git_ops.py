@@ -1,5 +1,6 @@
 import os
 import subprocess
+import shutil
 from pathlib import Path
 
 
@@ -24,7 +25,7 @@ def clone_and_checkout(repo_url: str, ref: str, workdir: str) -> str:
 
     repo_dir = workdir_path / "repo"
     if repo_dir.exists():
-        run(["rm", "-rf", str(repo_dir)])
+        shutil.rmtree(repo_dir, ignore_errors=True)
 
     # Clone using absolute destination; no cwd tricks -> no double nesting.
     run(["git", "clone", "--depth", "1", repo_url, str(repo_dir)], cwd=None)
