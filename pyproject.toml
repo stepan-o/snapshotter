@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "snapshotter"
+version = "0.1.0"
+description = "Repo Snapshotter v0.1 - AWS-ready scaffold (no logic yet)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Snapshotter Team" }
+]
+keywords = ["aws", "scaffold", "ecs", "batch", "snapshotter"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "pydantic>=2.5",
+  "boto3>=1.28",
+  "httpx>=0.25",
+  "typing-extensions>=4.8; python_version < '3.12'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.5.0",
+  "mypy>=1.8",
+  "pytest>=7.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/snapshotter"
+
+[project.scripts]
+snapshotter = "snapshotter.cli:main"
+
+[tool.uv]
+# Keep default settings; lock file committed to repo.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = false
+no_implicit_optional = true
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-q"
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "hatchling>=1.28.0",
+    "mypy>=1.19.1",
+    "pytest>=9.0.2",
+    "ruff>=0.14.11",
+]

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Builds
+build/
+dist/
+*.egg-info/
+
+# Snapshotter outputs
+out/
+.snapshotter_tmp/
+
+# IDE/OS
+.idea/
+.DS_Store
