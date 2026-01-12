@@ -11,7 +11,7 @@ Key design points
 - No Replit dependencies; no hardcoded secrets
 
 Requirements
-- Python 3.11+
+- Python 3.11 (baseline; CI/Docker use 3.11 explicitly)
 - uv (https://docs.astral.sh/uv/)
 - Docker (optional, for container builds)
 
@@ -48,6 +48,10 @@ See docs/AWS_RUNBOOK.md for guidance on running as an ECS Task or Batch job, pas
 
 Where to paste the real logic later
 - Put real implementation modules under src/snapshotter and wire them into snapshotter.main.run(). The current snapshotter.main.run() raises NotImplementedError as a clear signal until the code is pasted.
+
+Notes on tooling
+- CI uses "uv sync --frozen --all-groups" to prevent lockfile drift; it does not run "uv lock".
+- Packaging build-backend is hatchling, but it's added as a dev dependency only to silence IDE packaging warnings; it is not required at runtime inside the container image.
 
 License
 MIT

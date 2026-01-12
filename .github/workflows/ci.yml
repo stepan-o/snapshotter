@@ -24,10 +24,6 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | sh -s -- -y
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Generate lockfile
-        run: |
-          uv lock --all-groups
-
       - name: Sync dependencies (frozen)
         run: |
           uv sync --frozen --all-groups

@@ -9,6 +9,7 @@ Key principles
 - No hardcoded secrets: use AWS Secrets Manager for sensitive values such as OPENAI_API_KEY (to be used by future logic).
 - Logging: rely on container stdout/stderr streaming to CloudWatch Logs.
 - Data protection: enforce server-side encryption (SSE) for any S3 objects this job reads/writes (operational policy; not enforced in code at this time).
+- Python baseline: 3.11 is the required/runtime baseline for local, CI, and Docker.
 
 Container image
 - Build locally: make docker-build (image tag defaults to snapshotter:0.1.0)
@@ -18,6 +19,7 @@ Runtime contract
 - CLI: python -m snapshotter.cli
 - Env var: SNAPSHOTTER_JOB_JSON (string). Example: '{"repo_url": "https://github.com/org/repo", "ref": "main"}'
 - Exit codes: 0 on success; non-zero on error. Errors are also printed as a JSON object to stdout.
+- Python version: 3.11 (image uses python:3.11-slim)
 
 ECS Fargate (generic steps)
 1) Create task execution role (AWS managed policy: service-role/AmazonECSTaskExecutionRolePolicy) and a task role with least-privilege permissions your job needs (e.g., S3 read). Attach any required KMS permissions if accessing SSE-KMS objects.
@@ -58,6 +60,8 @@ Operational notes
 - Observability: All logs are written to stdout/stderr. Ensure your log group retention and metric filters meet your requirements.
 - Retries: Use ECS or Batch-level retry policies where appropriate.
 - Timeouts: Configure container/step timeouts at the scheduler level to prevent runaway tasks.
+- CI uses uv sync --frozen --all-groups (no uv lock in CI) to avoid lockfile drift.
+- Packaging build-backend is hatchling; it is included as a dev dependency to silence IDE warnings and is not needed at runtime in the container.
 
 Example payloads
 Small inline payload (for testing):
