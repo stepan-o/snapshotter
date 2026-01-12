@@ -8,21 +8,28 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install uv
-RUN apt-get update -y && apt-get install -y --no-install-recommends curl ca-certificates \
+# System deps:
+# - curl + ca-certificates: install uv + HTTPS
+# - git: required for Snapshotter (repo clone)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -LsSf https://astral.sh/uv/install.sh | sh -s -- -y \
-    && echo "export PATH=\"$HOME/.local/bin:$PATH\"" >> /etc/profile
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && ln -sf /root/.local/bin/uv /usr/local/bin/uv
 
 ENV PATH="/root/.local/bin:${PATH}"
 
-# Copy metadata and lockfile first for better caching
-COPY pyproject.toml uv.lock ./
+# Copy project metadata + README first (hatchling validates readme during build)
+COPY pyproject.toml uv.lock README.md ./
+
+# Copy source (uv sync will build/install the local project)
+COPY src ./src
 
 # Install dependencies (runtime only in image)
 RUN uv sync --frozen --no-dev
 
-# Copy source code
-COPY src ./src
+# IMPORTANT: run with the venv interpreter created by uv (otherwise `python` can't import snapshotter)
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
 CMD ["python", "-m", "snapshotter.cli"]

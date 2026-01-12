@@ -30,7 +30,7 @@ run:
 	fi
 
 docker-build:
-	$(UV) lock --all-groups
+	$(UV) lock
 	docker build -t $(IMAGE) .
 
 # Example: docker run --rm -e SNAPSHOTTER_JOB_JSON='{}' snapshotter:0.1.0

@@ -20,3 +20,9 @@ out/
 # IDE/OS noise
 .idea/
 .DS_Store
+
+# Git + tooling noise (optional)
+.git/
+*.log
+.coverage
+htmlcov/

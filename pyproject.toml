@@ -10,28 +10,30 @@ readme = "README.md"
 requires-python = ">=3.11,<3.12"
 license = { text = "MIT" }
 authors = [
-  { name = "Snapshotter Team" }
+    { name = "Snapshotter Team" }
 ]
 keywords = ["aws", "scaffold", "ecs", "batch", "snapshotter"]
 classifiers = [
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.11",
-  "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
 ]
 dependencies = [
-  "pydantic>=2.5",
-  "boto3>=1.28",
-  "httpx>=0.25",
-  "typing-extensions>=4.8; python_version < '3.12'",
+    "pydantic>=2.5",
+    "boto3>=1.28",
+    "httpx>=0.25",
+    "typing-extensions>=4.8; python_version < '3.12'",
 ]
 
-[project.optional-dependencies]
+# uv dependency groups (PEP 735). This is what `uv sync --all-groups` installs.
+[dependency-groups]
 dev = [
-  "ruff>=0.5.0",
-  "mypy>=1.8",
-  "pytest>=7.4",
-  "hatchling>=1.25.0",
+    "ruff>=0.5.0",
+    "mypy>=1.8",
+    "pytest>=7.4",
+    # Dev-only install to silence IDE packaging warnings (build backend is still in [build-system])
+    "hatchling>=1.25.0",
 ]
 
 [project.urls]
