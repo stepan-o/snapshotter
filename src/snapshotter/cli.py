@@ -22,6 +22,23 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return v in {"1", "true", "yes", "y", "on"}
 
 
+def _maybe_load_dotenv() -> None:
+    """
+    Local convenience only.
+
+    - If python-dotenv isn't installed, this is a no-op.
+    - If SNAPSHOTTER_DISABLE_DOTENV is truthy, skip.
+    - We load once, early, before reading env-based payloads/flags.
+    """
+    if _env_bool("SNAPSHOTTER_DISABLE_DOTENV", default=False):
+        return
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception:
+        return
+    load_dotenv()
+
+
 def _read_job_payload_required(args: argparse.Namespace) -> Tuple[Dict[str, Any], str]:
     """
     Canonical job input (priority order):
@@ -110,6 +127,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Local .env support (optional import, safe in AWS).
+    _maybe_load_dotenv()
+
     args = parse_args(argv)
 
     # dry_run: CLI flag OR env flag (matches old behavior expectations)

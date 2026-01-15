@@ -70,3 +70,8 @@ uv.lock.backup
 
 # Logs
 *.log
+
+# .env used for local development
+env/
+.env
+*.env
