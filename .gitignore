@@ -75,3 +75,5 @@ uv.lock.backup
 env/
 .env
 *.env
+
+.output.txt

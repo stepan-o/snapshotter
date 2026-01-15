@@ -97,11 +97,21 @@ JS_RESOLVE_EXTS = (
 )
 
 # Extremely common config locations (we scan these deterministically)
+# NOTE: Keep bounded + deterministic (no globbing).
 CONFIG_CANDIDATES = (
     "tsconfig.json",
     "jsconfig.json",
     "frontend/tsconfig.json",
     "frontend/jsconfig.json",
+    # common Next/monorepo-ish spots (still bounded)
+    "frontend/tsconfig.base.json",
+    "frontend/tsconfig.app.json",
+    "frontend/tsconfig.build.json",
+    "frontend/tsconfig.node.json",
+    "frontend/tsconfig.shared.json",
+    "apps/web/tsconfig.json",
+    "apps/frontend/tsconfig.json",
+    "packages/ui/tsconfig.json",
 )
 
 # -----------------------------
@@ -122,6 +132,35 @@ JS_ENV_PATTERNS = [
     # process.env["X"] / process.env['X']
     re.compile(r"""\bprocess\.env\[\s*["']([A-Z0-9_]+)["']\s*\]"""),
 ]
+
+# -----------------------------
+# Cheap routing/auth signals (repo-level)
+# -----------------------------
+
+# Next.js middleware matcher
+NEXT_MW_MATCHER_RE = re.compile(r"""(?ms)\bmatcher\s*:\s*(\[[^\]]*\])""")
+# Very cheap "protected paths" signal (common patterns, bounded)
+NEXT_PROTECTED_LIST_RE = re.compile(
+    r"""(?ms)\b(PROTECTED|PROTECTED_PATHS|protectedPaths|adminPaths)\b[^{=\n]*[=:]\s*(\[[^\]]*\])"""
+)
+
+# Frontend auth-ish surface signals
+FRONTEND_LOGIN_RE = re.compile(r"""(?i)\b(/login|/signin|sign[-_ ]?in)\b""")
+FRONTEND_AUTH_ME_RE = re.compile(r"""\b/auth/me\b""")
+FRONTEND_COOKIE_NAME_RE = re.compile(
+    r"""(?mx)
+    \b(?:cookie(?:Name)?|COOKIE_NAME|AUTH_COOKIE|ACCESS_TOKEN_COOKIE)\b
+    [^=\n]{0,80}
+    =
+    [^;\n]{0,120}
+    """
+)
+
+# Backend auth-ish signals
+PY_DEPENDS_RE = re.compile(r"""\bDepends\s*\(\s*([A-Za-z0-9_\.]+)\s*\)""")
+PY_GET_CURRENT_RE = re.compile(r"""\bget_current_[A-Za-z0-9_]+\b""")
+PY_AUTH_ROUTE_RE = re.compile(r"""\b/ath\b""")  # (placeholder / intentional: kept unused)
+PY_AUTH_PATH_RE = re.compile(r"""\b/auth/(me|login|signin|refresh|logout)\b""")
 
 
 def infer_language(path: str) -> str:
@@ -641,15 +680,31 @@ def _extract_tsconfig_aliases(repo_dir: str) -> dict[str, Any]:
 
     used = sorted(used)
 
-    return {
+    out = {
         "configs_used": used,
         "baseUrl": base_url_repo_rel,
         "paths": paths_repo_rel,
         "alias_prefixes": alias_prefixes,
     }
 
+    # Deterministic fingerprint so later diffs can distinguish "repo changed" vs "resolver changed"
+    fp_obj = {
+        "baseUrl": out.get("baseUrl"),
+        "alias_prefixes": out.get("alias_prefixes"),
+        "paths": out.get("paths"),
+        "configs_used": out.get("configs_used"),
+    }
+    fp_bytes = json.dumps(fp_obj, sort_keys=True, separators=(",", ":")).encode("utf-8", errors="replace")
+    out["active_rules_fingerprint_sha256"] = sha256_bytes(fp_bytes)
+
+    return out
+
 
 def _is_probably_external_js_spec(spec: str) -> bool:
+    """
+    Cheap classification heuristic.
+    NOTE: '@scope/...' is treated as ambiguous (workspace package OR external).
+    """
     s = (spec or "").strip()
     if not s:
         return True
@@ -661,7 +716,15 @@ def _is_probably_external_js_spec(spec: str) -> bool:
         return False
     if s.startswith("@/"):
         return False
+    if s.startswith("@") and "/" in s:
+        # ambiguous: could be workspace/internal or external package
+        return True
     return True
+
+
+def _is_ambiguous_scoped_js_spec(spec: str) -> bool:
+    s = (spec or "").strip()
+    return bool(s.startswith("@") and "/" in s and not s.startswith("@/"))
 
 
 def _candidate_paths_for_module_noext(module_noext: str) -> list[str]:
@@ -685,13 +748,41 @@ def _resolve_js_ts_import_to_repo_path(
         from_file_repo_path: str,
         repo_dir: str,
         alias_info: dict[str, Any],
-) -> str | None:
+) -> dict[str, Any]:
+    """
+    Resolver that returns a small, evidence-friendly record.
+    """
     s = (spec or "").strip()
     if not s:
-        return None
+        return {
+            "resolved_path": None,
+            "resolution_kind": None,
+            "resolution_candidates_tried_count": 0,
+            "resolution_attempted": False,
+            "classification": "external",
+            "classification_reason": "empty",
+        }
 
     repo_root = Path(repo_dir)
     from_dir = Path(from_file_repo_path).parent.as_posix().rstrip("/")
+
+    candidates_tried = 0
+
+    # helper
+    def _try_candidates(module_noext: str, kind: str) -> tuple[str | None, str | None, int]:
+        nonlocal candidates_tried
+        if not module_noext:
+            return None, None, 0
+        tried = 0
+        for cand in _candidate_paths_for_module_noext(module_noext):
+            tried += 1
+            candidates_tried += 1
+            if (repo_root / cand).exists():
+                # classify how we got here
+                if cand.endswith("/index.ts") or "/index." in cand:
+                    return _normalize_rel_path(cand), "index_file", tried
+                return _normalize_rel_path(cand), kind, tried
+        return None, None, tried
 
     # 1) relative
     if s.startswith(("./", "../")):
@@ -701,23 +792,51 @@ def _resolve_js_ts_import_to_repo_path(
         module_noext = module_noext.lstrip("./")
 
         if Path(s).suffix:
-            cand = module_noext
-            return cand if (repo_root / cand).exists() else None
+            candidates_tried += 1
+            cand = _normalize_rel_path(module_noext)
+            return {
+                "resolved_path": cand if (repo_root / cand).exists() else None,
+                "resolution_kind": "direct_file",
+                "resolution_candidates_tried_count": candidates_tried,
+                "resolution_attempted": True,
+                "classification": "internal_resolved" if (repo_root / cand).exists() else "internal_unresolved",
+                "classification_reason": "relative",
+            }
 
-        for cand in _candidate_paths_for_module_noext(module_noext):
-            if (repo_root / cand).exists():
-                return cand
-        return None
+        resolved, res_kind, _ = _try_candidates(module_noext, "ext_appended")
+        return {
+            "resolved_path": resolved,
+            "resolution_kind": res_kind,
+            "resolution_candidates_tried_count": candidates_tried,
+            "resolution_attempted": True,
+            "classification": "internal_resolved" if resolved else "internal_unresolved",
+            "classification_reason": "relative",
+        }
 
     # 2) rooted from repo root
     if s.startswith("/"):
         module_noext = s.lstrip("/")
         if Path(module_noext).suffix:
-            return _normalize_rel_path(module_noext) if (repo_root / module_noext).exists() else None
-        for cand in _candidate_paths_for_module_noext(module_noext):
-            if (repo_root / cand).exists():
-                return _normalize_rel_path(cand)
-        return None
+            candidates_tried += 1
+            cand = _normalize_rel_path(module_noext)
+            ok = (repo_root / cand).exists()
+            return {
+                "resolved_path": cand if ok else None,
+                "resolution_kind": "direct_file",
+                "resolution_candidates_tried_count": candidates_tried,
+                "resolution_attempted": True,
+                "classification": "internal_resolved" if ok else "internal_unresolved",
+                "classification_reason": "rooted",
+            }
+        resolved, res_kind, _ = _try_candidates(module_noext, "ext_appended")
+        return {
+            "resolved_path": resolved,
+            "resolution_kind": res_kind,
+            "resolution_candidates_tried_count": candidates_tried,
+            "resolution_attempted": True,
+            "classification": "internal_resolved" if resolved else "internal_unresolved",
+            "classification_reason": "rooted",
+        }
 
     # 3) alias prefixes (from tsconfig/jsconfig)
     alias_prefixes = alias_info.get("alias_prefixes", [])
@@ -741,35 +860,99 @@ def _resolve_js_ts_import_to_repo_path(
                     module_noext = _normalize_rel_path(module_noext)
 
                     if Path(s).suffix:
-                        if (repo_root / module_noext).exists():
-                            return module_noext
-                        continue
+                        candidates_tried += 1
+                        ok = (repo_root / module_noext).exists()
+                        return {
+                            "resolved_path": module_noext if ok else None,
+                            "resolution_kind": "alias_target",
+                            "resolution_candidates_tried_count": candidates_tried,
+                            "resolution_attempted": True,
+                            "classification": "internal_resolved" if ok else "internal_unresolved",
+                            "classification_reason": "alias_rule",
+                        }
 
-                    for cand in _candidate_paths_for_module_noext(module_noext):
-                        if (repo_root / cand).exists():
-                            return _normalize_rel_path(cand)
+                    resolved, res_kind, _ = _try_candidates(module_noext, "alias_target")
+                    return {
+                        "resolved_path": resolved,
+                        "resolution_kind": res_kind or "alias_target",
+                        "resolution_candidates_tried_count": candidates_tried,
+                        "resolution_attempted": True,
+                        "classification": "internal_resolved" if resolved else "internal_unresolved",
+                        "classification_reason": "alias_rule",
+                    }
 
     # 4) common Next alias fallback: "@/..." -> "frontend/..." (only if it exists)
     if s.startswith("@/"):
         tail = s[2:].lstrip("/")
         module_noext = _normalize_rel_path(f"frontend/{tail}")
         if Path(module_noext).suffix:
-            return module_noext if (repo_root / module_noext).exists() else None
-        for cand in _candidate_paths_for_module_noext(module_noext):
-            if (repo_root / cand).exists():
-                return _normalize_rel_path(cand)
+            candidates_tried += 1
+            ok = (repo_root / module_noext).exists()
+            return {
+                "resolved_path": module_noext if ok else None,
+                "resolution_kind": "fallback_at_slash",
+                "resolution_candidates_tried_count": candidates_tried,
+                "resolution_attempted": True,
+                "classification": "internal_resolved" if ok else "internal_unresolved",
+                "classification_reason": "at_slash",
+            }
+        resolved, res_kind, _ = _try_candidates(module_noext, "fallback_at_slash")
+        return {
+            "resolved_path": resolved,
+            "resolution_kind": res_kind or "fallback_at_slash",
+            "resolution_candidates_tried_count": candidates_tried,
+            "resolution_attempted": True,
+            "classification": "internal_resolved" if resolved else "internal_unresolved",
+            "classification_reason": "at_slash",
+        }
 
     # 5) baseUrl fallback for bare-ish internal paths (best-effort)
     base_url = alias_info.get("baseUrl")
     if isinstance(base_url, str) and base_url.strip():
         module_noext = _normalize_rel_path(f"{base_url.rstrip('/')}/{s.lstrip('/')}")
         if Path(module_noext).suffix:
-            return module_noext if (repo_root / module_noext).exists() else None
-        for cand in _candidate_paths_for_module_noext(module_noext):
-            if (repo_root / cand).exists():
-                return _normalize_rel_path(cand)
+            candidates_tried += 1
+            ok = (repo_root / module_noext).exists()
+            return {
+                "resolved_path": module_noext if ok else None,
+                "resolution_kind": "baseUrl",
+                "resolution_candidates_tried_count": candidates_tried,
+                "resolution_attempted": True,
+                "classification": "internal_resolved" if ok else "internal_unresolved",
+                "classification_reason": "baseUrl",
+            }
+        resolved, res_kind, _ = _try_candidates(module_noext, "baseUrl")
+        if resolved:
+            return {
+                "resolved_path": resolved,
+                "resolution_kind": res_kind or "baseUrl",
+                "resolution_candidates_tried_count": candidates_tried,
+                "resolution_attempted": True,
+                "classification": "internal_resolved",
+                "classification_reason": "baseUrl",
+            }
 
-    return None
+    # If we got here: unresolved. Classify as ambiguous/external or internal-candidate.
+    if _is_ambiguous_scoped_js_spec(s):
+        return {
+            "resolved_path": None,
+            "resolution_kind": None,
+            "resolution_candidates_tried_count": candidates_tried,
+            "resolution_attempted": True,
+            "classification": "external",
+            "classification_reason": "scoped_ambiguous",
+            "ambiguous": True,
+        }
+
+    # treat as external token
+    return {
+        "resolved_path": None,
+        "resolution_kind": None,
+        "resolution_candidates_tried_count": candidates_tried,
+        "resolution_attempted": True,
+        "classification": "external",
+        "classification_reason": "bare",
+    }
 
 
 def _candidate_paths_for_py_module(module_path: str) -> list[str]:
@@ -790,19 +973,34 @@ def _resolve_python_import_to_repo_path(
         spec: str,
         from_file_repo_path: str,
         repo_dir: str,
-) -> str | None:
+) -> dict[str, Any]:
     """
     Best-effort python import -> repo path resolver.
-    Supports:
-      - absolute module paths: "snapshotter.utils" -> snapshotter/utils.py or snapshotter/utils/__init__.py
-      - relative module specs with leading dots: ".utils", "..core", "."
+    Returns a small, evidence-friendly record.
     """
     s = (spec or "").strip()
     if not s:
-        return None
+        return {
+            "resolved_path": None,
+            "resolution_kind": None,
+            "resolution_candidates_tried_count": 0,
+            "resolution_attempted": False,
+            "classification": "external",
+            "classification_reason": "empty",
+        }
 
     repo_root = Path(repo_dir)
     from_dir = Path(from_file_repo_path).parent.as_posix().rstrip("/")
+
+    candidates_tried = 0
+
+    def _try_py_candidates(module_path: str) -> str | None:
+        nonlocal candidates_tried
+        for cand in _candidate_paths_for_py_module(module_path):
+            candidates_tried += 1
+            if (repo_root / cand).exists():
+                return _normalize_rel_path(cand)
+        return None
 
     # count leading dots for relative
     m = re.match(r"^(\.+)(.*)$", s)
@@ -826,17 +1024,27 @@ def _resolve_python_import_to_repo_path(
             module_path = base  # "from . import X" -> base package
 
         module_path = _normalize_rel_path(os.path.normpath(module_path).replace("\\", "/"))
-        for cand in _candidate_paths_for_py_module(module_path):
-            if (repo_root / cand).exists():
-                return _normalize_rel_path(cand)
-        return None
+        resolved = _try_py_candidates(module_path)
+        return {
+            "resolved_path": resolved,
+            "resolution_kind": "relative",
+            "resolution_candidates_tried_count": candidates_tried,
+            "resolution_attempted": True,
+            "classification": "internal_resolved" if resolved else "internal_unresolved",
+            "classification_reason": "relative",
+        }
 
     # absolute
     module_path = s.replace(".", "/")
-    for cand in _candidate_paths_for_py_module(module_path):
-        if (repo_root / cand).exists():
-            return _normalize_rel_path(cand)
-    return None
+    resolved = _try_py_candidates(module_path)
+    return {
+        "resolved_path": resolved,
+        "resolution_kind": "absolute",
+        "resolution_candidates_tried_count": candidates_tried,
+        "resolution_attempted": True,
+        "classification": "internal_resolved" if resolved else "external",
+        "classification_reason": "absolute",
+    }
 
 
 def _extract_env_var_edges(text: str, *, language: str) -> list[dict[str, Any]]:
@@ -942,6 +1150,116 @@ def _package_json_signals(text: str) -> dict[str, Any] | None:
     return sig or None
 
 
+def _maybe_extract_next_routing_signals(rel_path: str, text: str) -> dict[str, Any] | None:
+    """
+    Cheap (regex-only) Next routing/gating signals for middleware + route groups.
+    """
+    p = rel_path.replace("\\", "/")
+    if not p.startswith("frontend/"):
+        return None
+
+    out: dict[str, Any] = {}
+
+    # route group path hints: app/(admin)/...
+    if "/app/" in p and "/(" in p:
+        out["route_group_hint"] = p
+
+    # middleware matcher / protected lists
+    if p.endswith("/middleware.ts") or p.endswith("/middleware.js") or p.endswith("/middleware.tsx"):
+        m = NEXT_MW_MATCHER_RE.search(text)
+        if m:
+            out["middleware_matcher_raw"] = m.group(1)[:2000]  # bounded
+        m2 = NEXT_PROTECTED_LIST_RE.search(text)
+        if m2:
+            out["protected_list_raw"] = m2.group(2)[:2000]  # bounded
+
+    return out or None
+
+
+def _maybe_extract_auth_signals(rel_path: str, language: str, text: str) -> list[dict[str, Any]]:
+    """
+    Cheap repo-level auth surface signals (bounded, deterministic).
+    Emits occurrences for later aggregation + targeting.
+    """
+    p = rel_path.replace("\\", "/")
+    out: list[dict[str, Any]] = []
+
+    if language in ("typescript", "javascript"):
+        cleaned = strip_js_ts_comments(text)
+
+        # auth/me references
+        for m in FRONTEND_AUTH_ME_RE.finditer(cleaned):
+            out.append({"kind": "frontend_auth_me_ref", "path": p, "lineno": _lineno_from_index(cleaned, m.start())})
+
+        # login-ish strings
+        for m in FRONTEND_LOGIN_RE.finditer(cleaned):
+            out.append({"kind": "frontend_login_ref", "path": p, "lineno": _lineno_from_index(cleaned, m.start())})
+
+        # cookie name constants (very loose)
+        for m in FRONTEND_COOKIE_NAME_RE.finditer(cleaned):
+            out.append({"kind": "frontend_cookie_name_block", "path": p, "lineno": _lineno_from_index(cleaned, m.start())})
+
+    if language == "python":
+        # Depends(get_current_...)
+        for m in PY_DEPENDS_RE.finditer(text):
+            sym = (m.group(1) or "").strip()
+            if sym:
+                out.append(
+                    {
+                        "kind": "backend_depends_ref",
+                        "path": p,
+                        "lineno": _lineno_from_index(text, m.start()),
+                        "symbol": sym,
+                    }
+                )
+
+        for m in PY_GET_CURRENT_RE.finditer(text):
+            sym = (m.group(0) or "").strip()
+            if sym:
+                out.append(
+                    {
+                        "kind": "backend_get_current_ref",
+                        "path": p,
+                        "lineno": _lineno_from_index(text, m.start()),
+                        "symbol": sym,
+                    }
+                )
+
+        for m in PY_AUTH_PATH_RE.finditer(text):
+            out.append({"kind": "backend_auth_path_ref", "path": p, "lineno": _lineno_from_index(text, m.start())})
+
+    return out
+
+
+def _tags_for_read_plan_path(p: str) -> list[str]:
+    """
+    Deterministic tags inferred purely from path naming conventions.
+    """
+    tags: list[str] = []
+    s = (p or "").replace("\\", "/")
+    if not s:
+        return tags
+    if s.endswith("frontend/middleware.ts") or s.endswith("frontend/middleware.js"):
+        tags.append("next_middleware")
+    if "/app/" in s and s.endswith("/layout.tsx"):
+        tags.append("next_layout")
+    if "/app/" in s and s.endswith("/page.tsx"):
+        tags.append("next_page")
+    if "/app/" in s and "/(admin)" in s:
+        tags.append("next_admin_route_group")
+    if s.endswith("/route.ts") or s.endswith("/route.js"):
+        tags.append("next_route")
+    if s.endswith(("main.py", "app.py", "server.py")):
+        tags.append("backend_entrypoint")
+    if "auth" in s.lower():
+        tags.append("auth")
+    if "middleware" in s.lower():
+        tags.append("middleware")
+    if "rbac" in s.lower() or "admin" in s.lower():
+        tags.append("rbac_or_admin")
+    return tags
+
+
 def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
     files: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -968,9 +1286,23 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
         "entrypoints": [],  # list of {kind,path,why}
         "package_json": {},  # rel_path -> extracted signals
         "env_vars": [],  # list of {key, locations:[{path, lineno}]}
+        # NEW: routing/auth grounding (cheap)
+        "routing": {
+            "middleware": [],  # occurrences
+            "route_group_hints": [],  # paths
+        },
+        "auth": {
+            "occurrences": [],  # mixed frontend/backend
+        },
     }
+
     _env_locations: dict[str, list[dict[str, Any]]] = {}
     _entrypoint_set: set[tuple[str, str]] = set()  # (path, why)
+
+    # auth/routing occurrences sets for stable de-dupe
+    _routing_mw_set: set[tuple[str, int, str]] = set()
+    _routing_route_group_set: set[str] = set()
+    _auth_occ_set: set[str] = set()
 
     def record_skip(rel_path: str, reason: str, size: int | None = None):
         skipped.append({"path": rel_path, "reason": reason, "bytes": size or 0})
@@ -1059,6 +1391,31 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
                 if p and why and (p, why) not in _entrypoint_set:
                     _entrypoint_set.add((p, why))
 
+            # cheap routing signals
+            rs = _maybe_extract_next_routing_signals(rel_path, text)
+            if rs:
+                if "middleware_matcher_raw" in rs or "protected_list_raw" in rs:
+                    # store as occurrences
+                    lineno = 1
+                    key = f"{rel_path}:{lineno}:{rs.get('middleware_matcher_raw','')}:{rs.get('protected_list_raw','')}"
+                    if key not in _auth_occ_set:
+                        # reuse de-dupe set space safely with distinct prefix
+                        pass
+                    mw_key = (rel_path, lineno, (rs.get("middleware_matcher_raw") or "")[:200])
+                    if mw_key not in _routing_mw_set:
+                        _routing_mw_set.add(mw_key)
+                if "route_group_hint" in rs:
+                    pth = str(rs.get("route_group_hint") or "")
+                    if pth and pth not in _routing_route_group_set:
+                        _routing_route_group_set.add(pth)
+
+            # cheap auth signals
+            for occ in _maybe_extract_auth_signals(rel_path, language, text):
+                # stable key for de-dupe
+                k = json.dumps(occ, sort_keys=True, separators=(",", ":"))
+                if k not in _auth_occ_set:
+                    _auth_occ_set.add(k)
+
             if language == "python":
                 try:
                     top_defs, import_edges = parse_python_import_edges(text)
@@ -1071,30 +1428,44 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
 
                 internal_set: set[str] = set()
                 external_set: set[str] = set()
+                internal_unresolved_specs: set[str] = set()
 
                 for e in import_edges:
                     spec = str(e.get("spec", "")).strip()
                     if not spec:
                         continue
-                    resolved = _resolve_python_import_to_repo_path(
+
+                    res = _resolve_python_import_to_repo_path(
                         spec=spec, from_file_repo_path=rel_path, repo_dir=repo_dir
                     )
-                    if resolved:
-                        e["resolved_path"] = resolved
+
+                    e["resolved_path"] = res.get("resolved_path")
+                    e["resolution_kind"] = res.get("resolution_kind")
+                    e["resolution_candidates_tried_count"] = int(res.get("resolution_candidates_tried_count", 0) or 0)
+                    e["resolution_attempted"] = bool(res.get("resolution_attempted", False))
+                    e["classification"] = str(res.get("classification", "external"))
+                    e["classification_reason"] = str(res.get("classification_reason", "unknown"))
+
+                    if e["resolved_path"]:
                         e["is_external"] = False
-                        internal_set.add(resolved)
+                        internal_set.add(str(e["resolved_path"]))
                     else:
-                        e["resolved_path"] = None
-                        # relative specs are internal-candidate; mark unresolved
-                        if spec.startswith("."):
-                            flags.append("import_unresolved")
+                        # relative imports are internal-candidate but unresolved
+                        if spec.startswith(".") or str(e.get("classification")) == "internal_unresolved":
                             e["is_external"] = False
+                            internal_unresolved_specs.add(spec)
+                            flags.append("import_unresolved")
                         else:
                             e["is_external"] = True
-                        external_set.add(spec)
+                            external_set.add(spec)
 
                 imports_resolved_internal = sorted(internal_set)
                 imports_external = sorted(external_set)
+
+                # canonical list for Pass2 to chase
+                internal_unresolved_specs_sorted = sorted(internal_unresolved_specs)
+
+                ambiguous_specs_sorted: list[str] = []
 
             elif language in ("typescript", "javascript"):
                 try:
@@ -1110,32 +1481,55 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
 
                 internal_set: set[str] = set()
                 external_set: set[str] = set()
+                internal_unresolved_specs: set[str] = set()
+                ambiguous_specs: set[str] = set()
 
                 for e in import_edges:
                     spec = str(e.get("spec", "")).strip()
                     if not spec:
                         continue
-                    resolved = _resolve_js_ts_import_to_repo_path(
+
+                    res = _resolve_js_ts_import_to_repo_path(
                         spec=spec,
                         from_file_repo_path=rel_path,
                         repo_dir=repo_dir,
                         alias_info=path_aliases,
                     )
-                    if resolved:
-                        e["resolved_path"] = resolved
+
+                    e["resolved_path"] = res.get("resolved_path")
+                    e["resolution_kind"] = res.get("resolution_kind")
+                    e["resolution_candidates_tried_count"] = int(res.get("resolution_candidates_tried_count", 0) or 0)
+                    e["resolution_attempted"] = bool(res.get("resolution_attempted", False))
+                    e["classification"] = str(res.get("classification", "external"))
+                    e["classification_reason"] = str(res.get("classification_reason", "unknown"))
+
+                    if e["resolved_path"]:
                         e["is_external"] = False
-                        internal_set.add(resolved)
+                        internal_set.add(str(e["resolved_path"]))
                     else:
-                        e["resolved_path"] = None
-                        if not _is_probably_external_js_spec(spec):
-                            flags.append("import_unresolved")
+                        # internal-candidate vs external
+                        if spec.startswith(("./", "../", "/")) or spec.startswith("@/"):
                             e["is_external"] = False
-                        else:
+                            internal_unresolved_specs.add(spec)
+                            flags.append("import_unresolved")
+                        elif _is_ambiguous_scoped_js_spec(spec):
+                            # keep separate bucket; treat as external for compatibility
                             e["is_external"] = True
-                        external_set.add(spec)
+                            ambiguous_specs.add(spec)
+                            external_set.add(spec)
+                        else:
+                            if not _is_probably_external_js_spec(spec):
+                                e["is_external"] = False
+                                internal_unresolved_specs.add(spec)
+                                flags.append("import_unresolved")
+                            else:
+                                e["is_external"] = True
+                                external_set.add(spec)
 
                 imports_resolved_internal = sorted(internal_set)
                 imports_external = sorted(external_set)
+                internal_unresolved_specs_sorted = sorted(internal_unresolved_specs)
+                ambiguous_specs_sorted = sorted(ambiguous_specs)
 
             else:
                 imports_raw = parse_best_effort_pythonish_imports(text)
@@ -1144,6 +1538,8 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
                 # no reliable resolution here; treat as external tokens
                 imports_resolved_internal = []
                 imports_external = sorted(set(imports_raw))
+                internal_unresolved_specs_sorted = []
+                ambiguous_specs_sorted = []
 
             # package.json signals (repo-level)
             if rel_path.endswith("package.json") and language == "json":
@@ -1162,15 +1558,38 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
                     str(e.get("kind", "")),
                     str(e.get("spec", "")),
                     str(e.get("resolved_path") or ""),
+                    str(e.get("classification") or ""),
                     str(e.get("is_external", "")),
                 ),
             )
 
             deps_block = {
+                # canonical evidence list
                 "import_edges": import_edges_sorted,
+                # canonical buckets
+                "internal_resolved_paths": imports_resolved_internal,
+                "internal_unresolved_specs": internal_unresolved_specs_sorted,
+                "external_specs": imports_external,
+                "ambiguous_specs": ambiguous_specs_sorted,
+                # backward compat mirror (kept; Pass2 should prefer the canonical names above)
                 "internal": imports_resolved_internal,
                 "external": imports_external,
             }
+
+            # optional: re-export edges (subset of import_edges) for Pass2 closure work
+            export_edges = [
+                {
+                    "kind": str(e.get("kind", "")),
+                    "spec": str(e.get("spec", "")),
+                    "lineno": int(e.get("lineno", 1) or 1),
+                    "resolved_path": e.get("resolved_path"),
+                    "is_external": bool(e.get("is_external", False)),
+                }
+                for e in import_edges_sorted
+                if str(e.get("kind", "")) == "export_from"
+            ]
+            if export_edges:
+                deps_block["export_edges"] = export_edges
 
             files.append(
                 {
@@ -1198,9 +1617,132 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
     files.sort(key=lambda x: x["path"])
     skipped.sort(key=lambda x: x["path"])
 
+    # ------------------------------------------------------------------
+    # Build repo-wide dependency indexes (forward + reverse), derived solely from Pass1 facts
+    # ------------------------------------------------------------------
+    import_index_by_path: dict[str, Any] = {}
+    reverse_internal: dict[str, list[dict[str, Any]]] = {}
+
+    # make a fast lookup: path -> file record
+    file_by_path = {f.get("path"): f for f in files if isinstance(f, dict) and isinstance(f.get("path"), str)}
+
+    for f in files:
+        p = str(f.get("path", "") or "")
+        deps = f.get("deps") if isinstance(f.get("deps"), dict) else {}
+        if not p or not isinstance(deps, dict):
+            continue
+        internal_resolved = deps.get("internal_resolved_paths") or deps.get("internal") or []
+        internal_unresolved = deps.get("internal_unresolved_specs") or []
+        external_specs = deps.get("external_specs") or deps.get("external") or []
+        ambiguous_specs = deps.get("ambiguous_specs") or []
+
+        import_index_by_path[p] = {
+            "internal_resolved_paths": sorted([x for x in internal_resolved if isinstance(x, str) and x]),
+            "internal_unresolved_specs": sorted([x for x in internal_unresolved if isinstance(x, str) and x]),
+            "external_specs": sorted([x for x in external_specs if isinstance(x, str) and x]),
+            "ambiguous_specs": sorted([x for x in ambiguous_specs if isinstance(x, str) and x]),
+        }
+
+        # reverse edges from import_edges (stronger than the summarized lists)
+        edges = deps.get("import_edges") or []
+        if isinstance(edges, list):
+            for e in edges:
+                if not isinstance(e, dict):
+                    continue
+                rp = e.get("resolved_path")
+                if not isinstance(rp, str) or not rp:
+                    continue
+                if bool(e.get("is_external", False)):
+                    continue
+                reverse_internal.setdefault(rp, [])
+                reverse_internal[rp].append(
+                    {
+                        "path": p,
+                        "lineno": int(e.get("lineno", 1) or 1),
+                        "spec": str(e.get("spec", "") or ""),
+                        "kind": str(e.get("kind", "") or ""),
+                    }
+                )
+
+    # stable sort + de-dupe reverse map
+    reverse_internal_out: dict[str, Any] = {}
+    for target in sorted(reverse_internal.keys()):
+        lst = reverse_internal[target]
+        lst_sorted = sorted(lst, key=lambda x: (str(x.get("path", "")), int(x.get("lineno", 1) or 1), str(x.get("spec", ""))))
+        dedup: list[dict[str, Any]] = []
+        seen = set()
+        for it in lst_sorted:
+            t = (str(it.get("path", "")), int(it.get("lineno", 1) or 1), str(it.get("spec", "")), str(it.get("kind", "")))
+            if t not in seen:
+                seen.add(t)
+                dedup.append(
+                    {"path": t[0], "lineno": t[1], "spec": t[2], "kind": t[3]}
+                )
+        reverse_internal_out[target] = dedup
+
+    repo_import_index = {
+        "by_path": import_index_by_path,
+        "reverse_internal": reverse_internal_out,
+    }
+
+    # ------------------------------------------------------------------
+    # Read plan suggestions (existing) + enriched v2 + closure seeds
+    # ------------------------------------------------------------------
     read_plan_suggestions = suggest_files_to_read(files, max_files=120)
 
+    # enrich suggestions with tags + a light reason string
+    read_plan_suggestions_v2: list[dict[str, Any]] = []
+    if isinstance(read_plan_suggestions, list):
+        for p in read_plan_suggestions:
+            if not isinstance(p, str) or not p.strip():
+                continue
+            tags = _tags_for_read_plan_path(p)
+            reason = ",".join(tags) if tags else "read_plan"
+            read_plan_suggestions_v2.append({"path": p, "reason": reason, "tags": tags})
+
+    # closure seeds: prioritize middleware + auth hotspots + admin route groups
+    closure_seed_set: set[str] = set()
+
+    # 1) routing hints
+    for p in sorted(_routing_route_group_set):
+        closure_seed_set.add(p)
+
+    # 2) middleware file(s) if present
+    for p in file_by_path.keys():
+        if isinstance(p, str) and p.endswith(("frontend/middleware.ts", "frontend/middleware.js")):
+            closure_seed_set.add(p)
+
+    # 3) auth occurrences paths
+    auth_occ_paths: set[str] = set()
+    for k in _auth_occ_set:
+        try:
+            occ = json.loads(k)
+        except Exception:
+            continue
+        if isinstance(occ, dict):
+            pp = occ.get("path")
+            if isinstance(pp, str) and pp:
+                auth_occ_paths.add(pp)
+    for p in sorted(auth_occ_paths):
+        # keep bounded; but deterministic
+        if len(closure_seed_set) >= 60:
+            break
+        closure_seed_set.add(p)
+
+    # 4) anything tagged in the suggestion list as "next_middleware/auth/rbac"
+    for s in read_plan_suggestions_v2:
+        p = str(s.get("path", "") or "")
+        tags = s.get("tags") if isinstance(s.get("tags"), list) else []
+        if not p:
+            continue
+        if any(t in ("next_middleware", "auth", "rbac_or_admin", "next_admin_route_group") for t in tags):
+            closure_seed_set.add(p)
+
+    read_plan_closure_seeds = sorted(closure_seed_set)
+
+    # ------------------------------------------------------------------
     # finalize repo-level signals deterministically
+    # ------------------------------------------------------------------
     repo_signals["entrypoints"] = [
         {"kind": "entrypoint_hint", "path": p, "why": why}
         for (p, why) in sorted(_entrypoint_set, key=lambda t: (t[0], t[1]))
@@ -1221,9 +1763,47 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
         env_vars_out.append({"key": k, "locations": dedup})
     repo_signals["env_vars"] = env_vars_out
 
+    # routing aggregation
+    repo_signals["routing"]["route_group_hints"] = sorted(_routing_route_group_set)
+    repo_signals["routing"]["middleware"] = [
+        {"path": p, "lineno": ln, "matcher_preview": prev}
+        for (p, ln, prev) in sorted(_routing_mw_set, key=lambda t: (t[0], t[1], t[2]))
+    ]
+
+    # auth aggregation
+    auth_occ_list: list[dict[str, Any]] = []
+    for k in sorted(_auth_occ_set):
+        try:
+            occ = json.loads(k)
+        except Exception:
+            continue
+        if isinstance(occ, dict):
+            auth_occ_list.append(occ)
+    auth_occ_list = sorted(
+        auth_occ_list,
+        key=lambda o: (str(o.get("path", "")), int(o.get("lineno", 1) or 1), str(o.get("kind", "")), str(o.get("symbol", ""))),
+    )
+    repo_signals["auth"]["occurrences"] = auth_occ_list
+
+    # ------------------------------------------------------------------
     # Job contract: payload + derived fields live under repo_index.job
+    # ------------------------------------------------------------------
     job_block = job.model_dump()
     job_block["resolved_commit"] = "unknown"
+
+    # Optional: compact facts digest embedded (so Pass2 can be grounded on facts + pack)
+    facts_digest = {
+        "path_aliases_fingerprint_sha256": path_aliases.get("active_rules_fingerprint_sha256"),
+        "routing": repo_signals.get("routing"),
+        "auth": {
+            # keep this small: just paths + kinds (no full blocks)
+            "paths": sorted({str(o.get("path")) for o in auth_occ_list if isinstance(o, dict) and isinstance(o.get("path"), str)}),
+            "kinds": sorted({str(o.get("kind")) for o in auth_occ_list if isinstance(o, dict) and isinstance(o.get("kind"), str)}),
+        },
+        "import_index": {
+            "reverse_internal_keys_sample": list(sorted(repo_import_index["reverse_internal"].keys()))[:50],
+        },
+    }
 
     return {
         "generated_at": utc_ts(),
@@ -1234,11 +1814,15 @@ def build_repo_index(repo_dir: str, job: Job) -> dict[str, Any]:
             "files_skipped": len(skipped),
             "bytes_included": total_bytes,
         },
-        "path_aliases": path_aliases,  # unchanged
-        "signals": repo_signals,  # NEW: repo-level grounding signals
+        "path_aliases": path_aliases,  # unchanged (+ fingerprint)
+        "signals": repo_signals,  # repo-level grounding signals (expanded)
+        "facts": facts_digest,  # NEW: compact digest for Pass2 grounding
+        "import_index": repo_import_index,  # NEW: forward + reverse dependency indexes
         "files": files,
         "skipped_files": skipped,
-        "read_plan_suggestions": read_plan_suggestions,
+        "read_plan_suggestions": read_plan_suggestions,  # keep original for compatibility
+        "read_plan_suggestions_v2": read_plan_suggestions_v2,  # NEW: structured suggestions
+        "read_plan_closure_seeds": read_plan_closure_seeds,  # NEW: deterministic seeds for Pass2 closure
     }
 
 

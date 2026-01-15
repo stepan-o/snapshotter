@@ -30,10 +30,20 @@ class SemanticCaps:
     onboarding_enabled: bool
     model: str
     max_output_tokens: int
+
     # input caps (defensive; prevents accidental huge prompts)
     max_arch_input_chars: int
     max_arch_files: int
     max_arch_chars_per_file: int
+
+    # supporting pack caps (gaps + onboarding)
+    max_support_files: int
+    max_support_chars: int
+    max_support_chars_per_file: int
+
+    # pack graph expansion bounds
+    pack_dep_hops: int
+    pack_max_dep_edges_per_file: int
 
 
 def _bool_from_env(name: str, default: bool) -> bool:
@@ -56,12 +66,18 @@ def _int_from_env(name: str, default: int) -> int:
 def _semantic_caps_from_env() -> SemanticCaps:
     onboarding_enabled = _bool_from_env("SNAPSHOTTER_PASS2_ONBOARDING", True)
     model = os.environ.get("SNAPSHOTTER_LLM_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
-    # Lower default: we are no longer asking the model to emit dependency/evidence appendices.
     max_output_tokens = _int_from_env("SNAPSHOTTER_LLM_MAX_OUTPUT_TOKENS", 2000)
 
     max_arch_input_chars = _int_from_env("SNAPSHOTTER_PASS2_MAX_ARCH_INPUT_CHARS", 240_000)
     max_arch_files = _int_from_env("SNAPSHOTTER_PASS2_MAX_ARCH_FILES", 120)
     max_arch_chars_per_file = _int_from_env("SNAPSHOTTER_PASS2_MAX_ARCH_CHARS_PER_FILE", 9000)
+
+    max_support_files = _int_from_env("SNAPSHOTTER_PASS2_MAX_SUPPORT_FILES", 28)
+    max_support_chars = _int_from_env("SNAPSHOTTER_PASS2_MAX_SUPPORT_CHARS", 120_000)
+    max_support_chars_per_file = _int_from_env("SNAPSHOTTER_PASS2_MAX_SUPPORT_CHARS_PER_FILE", 9000)
+
+    pack_dep_hops = _int_from_env("SNAPSHOTTER_PASS2_PACK_DEP_HOPS", 1)
+    pack_max_dep_edges_per_file = _int_from_env("SNAPSHOTTER_PASS2_PACK_MAX_DEP_EDGES_PER_FILE", 12)
 
     return SemanticCaps(
         onboarding_enabled=onboarding_enabled,
@@ -70,6 +86,11 @@ def _semantic_caps_from_env() -> SemanticCaps:
         max_arch_input_chars=max_arch_input_chars,
         max_arch_files=max_arch_files,
         max_arch_chars_per_file=max_arch_chars_per_file,
+        max_support_files=max_support_files,
+        max_support_chars=max_support_chars,
+        max_support_chars_per_file=max_support_chars_per_file,
+        pack_dep_hops=pack_dep_hops,
+        pack_max_dep_edges_per_file=pack_max_dep_edges_per_file,
     )
 
 
@@ -308,7 +329,7 @@ def _openai_call_json(*, prompt: str, model: str, max_output_tokens: int, system
 
 
 # -------------------------------------------------------------------
-# Pass1 -> deterministic facts (deps/env/signals)
+# Pass1 -> deterministic facts (presence/signals/deps)
 # -------------------------------------------------------------------
 
 
@@ -339,10 +360,36 @@ def _signals_from_repo_index(repo_index: dict[str, Any]) -> dict[str, Any]:
     return sig if isinstance(sig, dict) else {}
 
 
+def _read_plan_suggestions(repo_index: dict[str, Any]) -> list[str]:
+    """
+    Pass1 emits read_plan_suggestions. Support a few shapes:
+      - list[str]
+      - list[{"path": "..."}]
+    """
+    v = repo_index.get("read_plan_suggestions")
+    out: list[str] = []
+    if isinstance(v, list):
+        for it in v:
+            if isinstance(it, str) and it.strip():
+                out.append(it.strip())
+            elif isinstance(it, dict):
+                p = it.get("path")
+                if isinstance(p, str) and p.strip():
+                    out.append(p.strip())
+    # deterministic unique preserving order
+    seen: set[str] = set()
+    dedup: list[str] = []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            dedup.append(p)
+    return dedup
+
+
 def _extract_pass1_deps(repo_index: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """
-    Canonical extraction based on Pass1 v2 schema:
-      file["deps"] + file["import_edges"].
+    Canonical extraction based on Pass1 schema:
+      file["deps"] + file["import_edges"] + compat fallback fields.
     Output per file:
       {
         "resolved_internal": set[str],
@@ -435,7 +482,6 @@ def _known_present_route_hints(repo_paths: set[str]) -> dict[str, Any]:
     """
     Tiny, high-signal presence hints to prevent 'not found in snapshot' hallucinations
     when the file exists but wasn't included in the LLM pack.
-    Kept intentionally small to avoid prompt bloat.
     """
     hints: dict[str, Any] = {}
 
@@ -466,7 +512,7 @@ def _known_present_route_hints(repo_paths: set[str]) -> dict[str, Any]:
 
 
 # -------------------------------------------------------------------
-# File selection (architecture + onboarding)
+# Pack selection (deterministic; bounded; driven by pass1 facts)
 # -------------------------------------------------------------------
 
 
@@ -482,115 +528,260 @@ def _truncate_with_tail(text: str, max_chars: int) -> str:
     return text[:head] + "\n/* …TRUNCATED… */\n" + text[-tail:]
 
 
-def _select_files_for_architecture(
+def _compute_available_dep_graph(
+        *,
+        available_paths: set[str],
+        deps_by_file: dict[str, dict[str, Any]],
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """
+    Returns (out_edges, in_edges) restricted to available_paths only.
+    out_edges[a] = {b} where a imports b (resolved_internal).
+    """
+    out_edges: dict[str, set[str]] = {p: set() for p in available_paths}
+    in_edges: dict[str, set[str]] = {p: set() for p in available_paths}
+
+    for p in available_paths:
+        info = deps_by_file.get(p)
+        if not info:
+            continue
+        for dep in info.get("resolved_internal", set()) or set():
+            if isinstance(dep, str) and dep in available_paths:
+                out_edges[p].add(dep)
+                in_edges[dep].add(p)
+
+    return out_edges, in_edges
+
+
+def _expand_seeds_by_deps(
+        *,
+        seeds: list[str],
+        out_edges: dict[str, set[str]],
+        hops: int,
+        max_added_per_file: int,
+) -> list[str]:
+    """
+    Deterministic graph expansion: BFS over out_edges for 'hops'.
+    Returns ordered unique list: seeds first, then expansion in sorted order per layer.
+    """
+    if hops <= 0:
+        return seeds
+
+    seen: set[str] = set()
+    order: list[str] = []
+
+    def _add(p: str) -> None:
+        if p not in seen:
+            seen.add(p)
+            order.append(p)
+
+    for s in seeds:
+        _add(s)
+
+    frontier = list(seeds)
+    for _ in range(hops):
+        nxt: list[str] = []
+        for p in frontier:
+            deps = sorted(list(out_edges.get(p, set())))
+            if max_added_per_file > 0:
+                deps = deps[:max_added_per_file]
+            for d in deps:
+                if d not in seen:
+                    _add(d)
+                    nxt.append(d)
+        frontier = nxt
+        if not frontier:
+            break
+
+    return order
+
+
+def _select_pack_paths_for_architecture(
         *,
         file_contents_map: dict[str, str],
         repo_index: dict[str, Any],
+        deps_by_file: dict[str, dict[str, Any]],
         caps: SemanticCaps,
-) -> dict[str, str]:
-    lang_by_path = _language_by_path_from_repo_index(repo_index)
+) -> tuple[list[str], dict[str, Any]]:
+    """
+    Deterministic pack selection:
+      - Start from pass1 entrypoints + pass1 read_plan_suggestions (intersection with available paths)
+      - Add hard-coded "spines" (frontend layout/middleware, backend main/security/config) if present
+      - Expand by internal deps within available set (bounded by hops + edges per file)
+      - Fill remaining budget by scored ranking (also deterministic)
+    Returns:
+      (ordered_paths, selection_debug)
+    """
+    available_paths = set(file_contents_map.keys())
     sig = _signals_from_repo_index(repo_index)
 
-    entrypoints: set[str] = set()
-    ep = sig.get("entrypoints")
-    if isinstance(ep, list):
-        for it in ep:
+    entrypoints: list[str] = []
+    eps = sig.get("entrypoints")
+    if isinstance(eps, list):
+        for it in eps:
             if isinstance(it, dict):
                 p = it.get("path")
-                if isinstance(p, str) and p:
-                    entrypoints.add(p)
+                if isinstance(p, str) and p in available_paths:
+                    entrypoints.append(p)
 
-    keys = sorted(file_contents_map.keys())
+    read_plan = [p for p in _read_plan_suggestions(repo_index) if p in available_paths]
+
+    # "spines" (best-effort; only if available)
+    must_consider = [
+        # backend
+        "backend/main.py",
+        "backend/app.py",
+        "backend/server.py",
+        "backend/security.py",
+        "backend/config.py",
+        "backend/db.py",
+        "backend/models.py",
+        # frontend
+        "frontend/middleware.ts",
+        "frontend/middleware.js",
+        "frontend/app/layout.tsx",
+        "frontend/app/layout.ts",
+        "frontend/app/page.tsx",
+        # tooling
+        "pyproject.toml",
+        "frontend/package.json",
+        "package.json",
+        "frontend/tsconfig.json",
+        "tsconfig.json",
+        "frontend/next.config.ts",
+        "frontend/next.config.js",
+        "README.md",
+        "readme.md",
+    ]
+    spines = [p for p in must_consider if p in available_paths]
+
+    # seeds: stable order = entrypoints (sorted), then spines (in declared order), then read_plan (in pass1 order)
+    seeds: list[str] = []
+    for p in sorted(entrypoints):
+        if p not in seeds:
+            seeds.append(p)
+    for p in spines:
+        if p not in seeds:
+            seeds.append(p)
+    for p in read_plan:
+        if p not in seeds:
+            seeds.append(p)
+
+    out_edges, in_edges = _compute_available_dep_graph(available_paths=available_paths, deps_by_file=deps_by_file)
+    expanded = _expand_seeds_by_deps(
+        seeds=seeds,
+        out_edges=out_edges,
+        hops=max(0, int(caps.pack_dep_hops)),
+        max_added_per_file=max(0, int(caps.pack_max_dep_edges_per_file)),
+    )
+
+    lang_by_path = _language_by_path_from_repo_index(repo_index)
 
     def score(p: str) -> int:
         pl = p.lower()
         s = 0
 
-        # highest priority: discovered entrypoints
-        if p in entrypoints:
+        # Seed boost
+        if p in seeds:
             s += 1000
+
+        # Entrypoints boost
+        if p in entrypoints:
+            s += 900
+
+        # Read plan boost
+        if p in read_plan:
+            s += 650
+
+        # Core conventions / likely "boundary" files
         if pl.endswith(("main.py", "app.py", "server.py")):
-            s += 220
+            s += 240
         if pl.endswith(("/route.ts", "/route.js", "/page.tsx", "/layout.tsx")):
             s += 220
-
-        # known “spines”
-        if pl in ("backend/main.py", "frontend/middleware.ts", "frontend/middleware.js"):
-            s += 700
-        if pl in ("frontend/app/layout.tsx", "frontend/app/layout.ts"):
-            s += 620
-
-        # ---- guardrails for common false "missing route" hallucinations ----
-        # login route: ensure included if present in file_contents_map
-        if pl.startswith("frontend/app/login/"):
-            s += 900
-        if pl == "frontend/app/login/page.tsx":
-            s += 1200
-        if pl == "frontend/app/login/loginpageclient.tsx":
-            s += 800
-
-        # case-studies route: ensure included if present in file_contents_map
-        if "frontend/app/case-studies/" in pl:
-            s += 800
-        if pl == "frontend/app/case-studies/page.tsx":
-            s += 1100
-        # -------------------------------------------------------------------
-
-        # backend clusters
-        if pl.startswith("backend/routers/"):
-            s += 480
-        if pl in ("backend/security.py", "backend/models.py", "backend/db.py", "backend/config.py"):
-            s += 420
-        if pl.startswith("backend/migrations/"):
-            s += 190
-        if pl.startswith("backend/scripts/"):
-            s += 140
-
-        # frontend clusters
-        if "/app/api/" in pl and pl.endswith(("/route.ts", "/route.js")):
-            s += 420
-        if "/app/" in pl and pl.endswith("/layout.tsx"):
-            s += 360
-        if "/app/" in pl and pl.endswith("/page.tsx"):
-            s += 300
-        if pl.startswith("frontend/lib/"):
-            s += 260
-        if pl.startswith("frontend/components/"):
-            s += 200
-
-        # docs + project metadata
-        if pl.endswith("readme.md") or pl == "readme.md":
-            s += 320
-        if pl.startswith("docs/"):
-            s += 260
-        if pl.endswith(".md"):
-            s += 120
-
-        # runtime/config files
-        if pl.endswith(("pyproject.toml", "alembic.ini", "package.json", "next.config.ts", "next.config.js")):
+        if pl.endswith(("middleware.ts", "middleware.js")):
+            s += 240
+        if "security" in pl or "auth" in pl:
             s += 220
-        if "eslint" in pl or pl.endswith(("makefile", "uv.lock", "package-lock.json", "tsconfig.json", "jsconfig.json")):
+        if "admin" in pl:
             s += 120
-        if pl.endswith((".env.example", ".env", "dockerfile", "docker-compose.yml", "docker-compose.yaml")):
+        if "gate" in pl or "rbac" in pl or "role" in pl or "permission" in pl:
+            s += 120
+
+        # Dependency centrality within available pack
+        s += min(80, 10 * len(in_edges.get(p, set())))
+        s += min(40, 5 * len(out_edges.get(p, set())))
+
+        # Clusters
+        if pl.startswith("backend/routers/"):
+            s += 220
+        if pl.startswith("backend/"):
+            s += 60
+        if "/app/api/" in pl and pl.endswith(("/route.ts", "/route.js")):
+            s += 180
+        if pl.startswith("frontend/lib/"):
             s += 140
+        if pl.startswith("frontend/components/"):
+            s += 120
+
+        # Docs/config
+        if pl.endswith("readme.md") or pl == "readme.md":
+            s += 200
+        if pl.startswith("docs/"):
+            s += 120
+        if pl.endswith(("pyproject.toml", "alembic.ini", "package.json", "next.config.ts", "next.config.js")):
+            s += 160
+        if pl.endswith(("uv.lock", "package-lock.json", "tsconfig.json", "jsconfig.json")):
+            s += 90
 
         lang = lang_by_path.get(p, "")
         if lang in ("python", "typescript", "javascript"):
-            s += 15
+            s += 10
 
         return s
 
-    ranked = sorted(keys, key=lambda p: (-score(p), p))
+    # Ranking: start from expanded (already ordered), then fill by global ranking
+    ranked_all = sorted(list(available_paths), key=lambda p: (-score(p), p))
+    ordered: list[str] = []
+    seen: set[str] = set()
 
+    def push(p: str) -> None:
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
+
+    for p in expanded:
+        push(p)
+    for p in ranked_all:
+        push(p)
+
+    selection_debug = {
+        "available_files": len(available_paths),
+        "seeds_count": len(seeds),
+        "seed_entrypoints": sorted(entrypoints),
+        "seed_spines": spines,
+        "seed_read_plan": read_plan[:40],
+        "dep_hops": caps.pack_dep_hops,
+        "dep_edges_per_file": caps.pack_max_dep_edges_per_file,
+        "expanded_count": len(expanded),
+    }
+    return ordered, selection_debug
+
+
+def _build_arch_files_pack(
+        *,
+        ordered_paths: list[str],
+        file_contents_map: dict[str, str],
+        caps: SemanticCaps,
+) -> dict[str, str]:
+    """
+    Apply caps (files + total chars + per-file chars) to the already-ordered list.
+    """
     out: dict[str, str] = {}
     total = 0
-
-    for p in ranked:
+    for p in ordered_paths:
         if len(out) >= caps.max_arch_files:
             break
-
         c = file_contents_map.get(p, "")
-        if not isinstance(c, str):
+        if not isinstance(c, str) or not c:
             continue
 
         remaining = caps.max_arch_input_chars - total
@@ -600,22 +791,21 @@ def _select_files_for_architecture(
         c2 = _truncate_with_tail(c, caps.max_arch_chars_per_file)
         if len(c2) > remaining:
             c2 = _truncate_with_tail(c2, remaining)
-
         if not c2:
             continue
 
         out[p] = c2
         total += len(c2)
 
-    # floor: ensure we have enough breadth to summarize architecture
-    if len(out) < 12:
-        for p in keys:
+    # Floor: ensure some minimum breadth
+    if len(out) < min(12, caps.max_arch_files):
+        for p in ordered_paths:
             if len(out) >= min(24, caps.max_arch_files):
                 break
             if p in out:
                 continue
             c = file_contents_map.get(p, "")
-            if not isinstance(c, str):
+            if not isinstance(c, str) or not c:
                 continue
             remaining = caps.max_arch_input_chars - total
             if remaining <= 0:
@@ -630,67 +820,153 @@ def _select_files_for_architecture(
 
 
 def _select_supporting_files_for_gaps_and_onboarding(
-        file_contents_map: dict[str, str], *, max_files: int = 28, max_total_chars: int = 120_000
+        file_contents_map: dict[str, str],
+        repo_index: dict[str, Any],
+        *,
+        max_files: int,
+        max_total_chars: int,
+        max_chars_per_file: int,
 ) -> dict[str, str]:
-    keys = sorted(file_contents_map.keys())
+    """
+    Deterministic supporting pack:
+      - Start from read_plan_suggestions (intersection with available)
+      - Add common docs/config/entrypoints
+      - Fill by stable ranking
+    """
+    available = set(file_contents_map.keys())
+    sig = _signals_from_repo_index(repo_index)
+
+    entrypoints: set[str] = set()
+    eps = sig.get("entrypoints")
+    if isinstance(eps, list):
+        for it in eps:
+            if isinstance(it, dict):
+                p = it.get("path")
+                if isinstance(p, str) and p in available:
+                    entrypoints.add(p)
+
+    read_plan = [p for p in _read_plan_suggestions(repo_index) if p in available]
+
+    must = []
+    for p in (
+            "README.md",
+            "readme.md",
+            "pyproject.toml",
+            "uv.lock",
+            "alembic.ini",
+            "package.json",
+            "frontend/package.json",
+            "tsconfig.json",
+            "frontend/tsconfig.json",
+            "frontend/next.config.ts",
+            "frontend/next.config.js",
+            "backend/main.py",
+            "backend/security.py",
+            "backend/config.py",
+            "frontend/middleware.ts",
+            "frontend/app/layout.tsx",
+    ):
+        if p in available:
+            must.append(p)
+
+    keys = sorted(list(available))
 
     def score(p: str) -> int:
-        p_low = p.lower()
+        pl = p.lower()
         s = 0
-        if p_low.endswith("readme.md") or p_low == "readme.md":
-            s += 220
-        if p_low.startswith("docs/") or "/docs/" in p_low:
-            s += 180
-        if p_low.endswith(".md"):
+        if p in read_plan:
+            s += 800
+        if p in entrypoints:
+            s += 700
+        if pl.endswith("readme.md") or pl == "readme.md":
+            s += 260
+        if pl.startswith("docs/") or "/docs/" in pl:
+            s += 200
+        if pl.endswith(".md"):
+            s += 150
+        if pl.endswith(("pyproject.toml", "alembic.ini")):
             s += 140
-        if p_low.endswith(("pyproject.toml", "alembic.ini")):
-            s += 130
-        if p_low.endswith(("makefile", "uv.lock")):
-            s += 110
-        if "next.config" in p_low or "eslint" in p_low:
-            s += 100
-        if p_low.endswith(("backend/main.py", "backend/config.py", "backend/security.py")):
-            s += 85
-        if p_low.endswith(("frontend/app/layout.tsx", "frontend/middleware.ts")):
-            s += 80
-        if p_low.endswith(("package.json", "tsconfig.json", "jsconfig.json")):
-            s += 75
-
-        # keep these high so gaps pass has grounding if it wants to mention them
-        if p_low.startswith("frontend/app/login/"):
+        if pl.endswith(("makefile", "uv.lock")):
             s += 120
-        if "frontend/app/case-studies/" in p_low:
+        if "next.config" in pl or "eslint" in pl:
             s += 110
-
-        if p_low.endswith((".ts", ".tsx")):
-            s += 10
-        if p_low.endswith((".py",)):
+        if pl.endswith(("backend/main.py", "backend/config.py", "backend/security.py")):
+            s += 95
+        if pl.endswith(("frontend/app/layout.tsx", "frontend/middleware.ts")):
+            s += 90
+        if pl.endswith(("package.json", "tsconfig.json", "jsconfig.json")):
+            s += 85
+        if pl.endswith((".ts", ".tsx", ".py")):
             s += 10
         return s
 
     ranked = sorted(keys, key=lambda p: (-score(p), p))
 
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def push(p: str) -> None:
+        if p not in seen:
+            seen.add(p)
+            ordered.append(p)
+
+    for p in must:
+        push(p)
+    for p in read_plan:
+        push(p)
+    for p in ranked:
+        push(p)
+
     out: dict[str, str] = {}
     total = 0
-    for p in ranked:
+    for p in ordered:
         if len(out) >= max_files:
             break
         c = file_contents_map.get(p, "")
-        if not isinstance(c, str):
+        if not isinstance(c, str) or not c:
             continue
         remaining = max_total_chars - total
         if remaining <= 0:
             break
-        if len(c) > remaining:
-            c = c[:remaining]
-        out[p] = c
-        total += len(c)
+        c2 = _truncate_with_tail(c, min(max_chars_per_file, remaining))
+        if not c2:
+            continue
+        out[p] = c2
+        total += len(c2)
 
     return out
 
 
+def _deps_hints_for_pack(
+        *,
+        pack_paths: list[str],
+        deps_by_file: dict[str, dict[str, Any]],
+        max_internal: int = 10,
+        max_external: int = 8,
+) -> dict[str, Any]:
+    """
+    Tiny, deterministic hints (NOT appendices):
+      per pack file: counts + a few internal deps, a few external specs, plus flags.
+    """
+    out: dict[str, Any] = {}
+    for p in pack_paths:
+        info = deps_by_file.get(p) or {}
+        internal = sorted([x for x in (info.get("resolved_internal", set()) or set()) if isinstance(x, str)])
+        external = sorted([x for x in (info.get("external_specs", set()) or set()) if isinstance(x, str)])
+        flags = sorted([x for x in (info.get("flags", set()) or set()) if isinstance(x, str)])
+
+        out[p] = {
+            "internal_deps_sample": internal[:max_internal],
+            "external_specs_sample": external[:max_external],
+            "internal_dep_count": len(internal),
+            "external_spec_count": len(external),
+            "flags": flags[:12],
+        }
+    return out
+
+
 # -------------------------------------------------------------------
-# Prompt payloads (LLM output is SMALL: modules + anchor_paths + short semantics)
+# Prompt payloads (LLM output stays SMALL + grounded)
 # -------------------------------------------------------------------
 
 
@@ -701,12 +977,20 @@ def _build_architecture_payload(
         job_id: str,
         repo_index: dict[str, Any],
         file_contents_map: dict[str, str],
+        deps_by_file: dict[str, dict[str, Any]],
         caps: SemanticCaps,
-) -> dict[str, Any]:
-    arch_files = _select_files_for_architecture(file_contents_map=file_contents_map, repo_index=repo_index, caps=caps)
+) -> tuple[dict[str, Any], list[str]]:
+    ordered_paths, selection_debug = _select_pack_paths_for_architecture(
+        file_contents_map=file_contents_map,
+        repo_index=repo_index,
+        deps_by_file=deps_by_file,
+        caps=caps,
+    )
+    arch_files = _build_arch_files_pack(ordered_paths=ordered_paths, file_contents_map=file_contents_map, caps=caps)
+    pack_paths = list(arch_files.keys())
     files_pack: list[dict[str, Any]] = [{"path": p, "content": c} for p, c in arch_files.items()]
 
-    # signals are useful, cheap, and deterministic
+    # deterministic, cheap facts
     signals = _signals_from_repo_index(repo_index)
     path_aliases = repo_index.get("path_aliases", {})
     if not isinstance(path_aliases, dict):
@@ -715,51 +999,58 @@ def _build_architecture_payload(
     repo_paths = _repo_paths_set(repo_index)
     presence_hints = _known_present_route_hints(repo_paths)
 
-    # Keep pass1 counts/signals only; do NOT inject deps_by_file into the prompt.
-    return {
-        "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit, "job_id": job_id},
-        "rules": {
-            "grounding": (
-                "Your statements MUST be grounded in the anchor_paths you cite. "
-                "If unsure, set responsibilities=['unknown'] and add an uncertainty with questions."
-            ),
-            "anchor_paths_constraint": "Every module anchor_paths MUST be a subset of pass2.files[].path.",
-            "no_appendices": (
-                "Do NOT output dependency lists, file inventories, read plans, or audit appendices. "
-                "This pass is semantic: boundaries, runtime entrypoints, key flows."
-            ),
-            # critical: stop claiming 'missing from snapshot' when it's only missing from the pack
-            "missing_claims_rule": (
-                "You can only claim a feature/file is 'missing from the snapshot' if it is absent from repo_presence_hints. "
-                "If you did not see a file in pass2.files, say 'not included in provided file contents' instead of 'missing from repo'."
-            ),
-        },
-        "pass1": {
-            "counts": repo_index.get("counts", {}),
-            "path_aliases": path_aliases,
-            "signals": {
-                "entrypoints": signals.get("entrypoints", []),
-                "env_vars": signals.get("env_vars", []),
-                "package_json": signals.get("package_json", {}),
+    deps_hints = _deps_hints_for_pack(pack_paths=pack_paths, deps_by_file=deps_by_file)
+
+    return (
+        {
+            "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit, "job_id": job_id},
+            "rules": {
+                "grounding": (
+                    "Your statements MUST be grounded in the anchor_paths you cite. "
+                    "If unsure, set responsibilities=['unknown'] and add an uncertainty with questions."
+                ),
+                "anchor_paths_constraint": "Every module anchor_paths MUST be a subset of pass2.files[].path.",
+                "no_appendices": (
+                    "Do NOT output dependency lists, file inventories, read plans, or audit appendices. "
+                    "This pass is semantic: boundaries, runtime entrypoints, key flows."
+                ),
+                "missing_claims_rule": (
+                    "You can only claim a feature/file is 'missing from the snapshot' if it is absent from repo_presence_hints. "
+                    "If you did not see a file in pass2.files, say 'not included in provided file contents' instead of 'missing from repo'."
+                ),
+            },
+            "pass1": {
+                "counts": repo_index.get("counts", {}),
+                "path_aliases": path_aliases,
+                "signals": {
+                    "entrypoints": signals.get("entrypoints", []),
+                    "env_vars": signals.get("env_vars", []),
+                    "package_json": signals.get("package_json", {}),
+                },
+                "read_plan_suggestions_sample": _read_plan_suggestions(repo_index)[:40],
+                "pack_selection": selection_debug,
+            },
+            "repo_presence_hints": presence_hints,
+            "pass2": {
+                "files": files_pack,
+                "deps_hints_by_file": deps_hints,
+            },
+            "output_contract": {
+                "return_json_object_with_keys": ["modules", "uncertainties"],
+                "modules_require": ["name", "type", "summary", "anchor_paths"],
+                "recommended_module_fields": [
+                    "responsibilities",
+                    "entrypoints",
+                    "public_interfaces",
+                    "data_flows",
+                    "runtime_notes",
+                    "where_to_change",
+                    "risk_notes",
+                ],
             },
         },
-        # tiny presence hints only (do not dump full repo path list)
-        "repo_presence_hints": presence_hints,
-        "pass2": {"files": files_pack},
-        "output_contract": {
-            "return_json_object_with_keys": ["modules", "uncertainties"],
-            "modules_require": ["name", "type", "summary", "anchor_paths"],
-            "recommended_module_fields": [
-                "responsibilities",
-                "entrypoints",
-                "public_interfaces",
-                "data_flows",
-                "runtime_notes",
-                "where_to_change",
-                "risk_notes",
-            ],
-        },
-    }
+        pack_paths,
+    )
 
 
 def _architecture_prompt_text(payload: dict[str, Any]) -> str:
@@ -795,8 +1086,15 @@ def _build_gaps_onboarding_payload(
         arch_uncertainties: list[dict[str, Any]],
         deterministic_gap_items: list[dict[str, Any]],
         file_contents_map: dict[str, str],
+        caps: SemanticCaps,
 ) -> dict[str, Any]:
-    support_files = _select_supporting_files_for_gaps_and_onboarding(file_contents_map)
+    support_files = _select_supporting_files_for_gaps_and_onboarding(
+        file_contents_map,
+        repo_index,
+        max_files=caps.max_support_files,
+        max_total_chars=caps.max_support_chars,
+        max_chars_per_file=caps.max_support_chars_per_file,
+    )
 
     modules_summary: list[dict[str, Any]] = []
     for m in arch_modules:
@@ -847,6 +1145,7 @@ def _build_gaps_onboarding_payload(
                 "env_vars": env_vars,
                 "package_json": pkg,
             },
+            "read_plan_suggestions_sample": _read_plan_suggestions(repo_index)[:40],
         },
         "repo_presence_hints": presence_hints,
         "architecture_summary": {
@@ -885,7 +1184,7 @@ def _gaps_onboarding_prompt_text(payload: dict[str, Any]) -> str:
 
 
 # -------------------------------------------------------------------
-# Deterministic derivations (NO LLM dependency enforcement)
+# Deterministic derivations (deps derived from pass1; no LLM deps)
 # -------------------------------------------------------------------
 
 
@@ -934,9 +1233,9 @@ def _deterministic_gap_scan(repo_index: dict[str, Any]) -> list[dict[str, Any]]:
     files = repo_index.get("files", []) or []
     sig = _signals_from_repo_index(repo_index)
 
-    # (1) unresolved internal imports flagged by pass1
     unresolved_paths: list[str] = []
     parse_failed: list[str] = []
+
     for f in files:
         if not isinstance(f, dict):
             continue
@@ -975,7 +1274,6 @@ def _deterministic_gap_scan(repo_index: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
 
-    # (2) missing entrypoint hints
     eps = sig.get("entrypoints", [])
     if not isinstance(eps, list) or len(eps) == 0:
         items.append(
@@ -1040,15 +1338,12 @@ def _post_enforce_architecture_constraints(
             anchors = []
         anchors = [p for p in anchors if isinstance(p, str) and p in allowed_paths]
 
-        # enforce 3–10 anchor paths if possible
         if len(anchors) > 10:
             anchors = anchors[:10]
         mm["anchor_paths"] = anchors
 
-        # summary (required)
         summary = mm.get("summary")
         if not isinstance(summary, str) or not summary.strip():
-            # salvage from responsibilities if present
             resp = mm.get("responsibilities")
             if isinstance(resp, list):
                 resp2 = [r for r in resp if isinstance(r, str) and r.strip()]
@@ -1056,11 +1351,11 @@ def _post_enforce_architecture_constraints(
                     summary = "; ".join(resp2[:3])
             mm["summary"] = summary.strip() if isinstance(summary, str) and summary.strip() else "unknown"
 
-        # responsibilities (optional but useful)
         resp = mm.get("responsibilities")
         if not isinstance(resp, list):
             resp = []
         resp = [r for r in resp if isinstance(r, str) and r.strip()]
+
         if not anchors:
             mm["responsibilities"] = ["unknown"]
             mm["summary"] = "unknown"
@@ -1084,10 +1379,9 @@ def _post_enforce_architecture_constraints(
                     }
                 )
 
-        # Do NOT accept/require deps from LLM output
+        # Do NOT accept deps from LLM output
         mm["dependencies"] = []
-        # downstream compat (populated later, but keep field stable)
-        mm["evidence_paths"] = list(anchors)
+        mm["evidence_paths"] = list(anchors)  # compat (populated later too)
 
         out_modules.append(mm)
 
@@ -1193,9 +1487,11 @@ def _rewrite_known_false_missing_items(items: list[dict[str, Any]], repo_paths: 
                 return []
             return [p for p in fi if isinstance(p, str) and p]
 
-        # /login false "missing"
         if has_login and ("/login" in desc_l or "login page" in desc_l):
-            if "not found" in desc_l or "no route" in desc_l or "missing" in desc_l or t in ("incomplete_extraction", "missing_docs"):
+            if "not found" in desc_l or "no route" in desc_l or "missing" in desc_l or t in (
+                    "incomplete_extraction",
+                    "missing_docs",
+            ):
                 it2 = dict(it)
                 it2["type"] = "prompt_coverage_gap"
                 it2["severity"] = "low"
@@ -1211,9 +1507,11 @@ def _rewrite_known_false_missing_items(items: list[dict[str, Any]], repo_paths: 
                 out.append(it2)
                 continue
 
-        # /case-studies false "missing"
         if has_case_studies and ("/case-studies" in desc_l or "case studies" in desc_l):
-            if "not found" in desc_l or "no route" in desc_l or "missing" in desc_l or t in ("missing_docs", "incomplete_extraction"):
+            if "not found" in desc_l or "no route" in desc_l or "missing" in desc_l or t in (
+                    "missing_docs",
+                    "incomplete_extraction",
+            ):
                 it2 = dict(it)
                 it2["type"] = "prompt_coverage_gap"
                 it2["severity"] = "low"
@@ -1246,14 +1544,12 @@ def _rewrite_known_false_missing_uncertainties(uncertainties: list[dict[str, Any
             continue
         desc = (u.get("description") or "")
         desc_l = desc.lower()
-        typ = (u.get("type") or "").strip()
 
         files_involved = u.get("files_involved")
         if not isinstance(files_involved, list):
             files_involved = []
         files_involved = [p for p in files_involved if isinstance(p, str) and p]
 
-        # login uncertainty false positive
         if has_login and ("/login" in desc_l or "login page" in desc_l) and ("not found" in desc_l or "unknown" in desc_l):
             u2 = dict(u)
             u2["type"] = "prompt_coverage_gap"
@@ -1271,8 +1567,9 @@ def _rewrite_known_false_missing_uncertainties(uncertainties: list[dict[str, Any
             out.append(u2)
             continue
 
-        # case-studies uncertainty false positive
-        if has_case_studies and ("/case-studies" in desc_l or "case studies" in desc_l) and ("not found" in desc_l or "unknown" in desc_l):
+        if has_case_studies and ("/case-studies" in desc_l or "case studies" in desc_l) and (
+                "not found" in desc_l or "unknown" in desc_l
+        ):
             u2 = dict(u)
             u2["type"] = "prompt_coverage_gap"
             u2["description"] = (
@@ -1309,27 +1606,26 @@ def generate_pass2_semantic_artifacts(
         file_contents_map: dict[str, str],
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
     """
-    Drop-in replacement behavior:
-      - Pass2 LLM outputs ONLY: semantic modules + anchor_paths + short text
-      - evidence_paths and dependencies are derived deterministically after the fact
-      - no LLM dependency reconciliation, no dependency_mismatch gap spam
-
-    Fixes included:
-      - Boost selection for /login and /case-studies files so they land in the LLM pack
-      - Explicit prompt rule: don't claim "missing from snapshot" if merely missing from provided contents
-      - Deterministic rewrite of known false-positive 'missing' gaps/uncertainties for /login + /case-studies
+    Behavior:
+      - Pass2 LLM outputs ONLY: semantic modules + anchor_paths + short semantics
+      - evidence_paths and dependencies are derived deterministically from pass1 after the fact
+      - bounded read pack is selected deterministically from pass1 facts (entrypoints + read_plan + deps expansion),
+        but constrained to the actually provided file_contents_map (no hidden reads)
     """
     caps = _semantic_caps_from_env()
+
+    deps_by_file = _extract_pass1_deps(repo_index)
 
     # -------------------------
     # Architecture semantics
     # -------------------------
-    arch_payload = _build_architecture_payload(
+    arch_payload, pack_paths = _build_architecture_payload(
         repo_url=repo_url,
         resolved_commit=resolved_commit,
         job_id=job_id,
         repo_index=repo_index,
         file_contents_map=file_contents_map,
+        deps_by_file=deps_by_file,
         caps=caps,
     )
     arch_prompt = _architecture_prompt_text(arch_payload)
@@ -1351,16 +1647,12 @@ def generate_pass2_semantic_artifacts(
     )
 
     # deterministically attach deps (and evidence_paths := anchor_paths for compat)
-    deps_by_file = _extract_pass1_deps(repo_index)
     enforced_modules = _derive_deps_from_anchor_paths(enforced_modules, deps_by_file)
 
     # rewrite known false-positive uncertainties (prompt coverage vs repo reality)
     enforced_uncertainties = _rewrite_known_false_missing_uncertainties(enforced_uncertainties, repo_paths)
 
-    arch_out: dict[str, Any] = {
-        "modules": enforced_modules,
-        "uncertainties": enforced_uncertainties,
-    }
+    arch_out: dict[str, Any] = {"modules": enforced_modules, "uncertainties": enforced_uncertainties}
 
     # -------------------------
     # Deterministic gaps (non-LLM)
@@ -1368,7 +1660,7 @@ def generate_pass2_semantic_artifacts(
     deterministic_gap_items = _deterministic_gap_scan(repo_index)
 
     # -------------------------
-    # LLM gaps + onboarding (no deterministic dumping)
+    # LLM gaps + onboarding (bounded supporting pack)
     # -------------------------
     gaps_payload = _build_gaps_onboarding_payload(
         repo_url=repo_url,
@@ -1380,6 +1672,7 @@ def generate_pass2_semantic_artifacts(
         arch_uncertainties=enforced_uncertainties,
         deterministic_gap_items=deterministic_gap_items,
         file_contents_map=file_contents_map,
+        caps=caps,
     )
     gaps_prompt = _gaps_onboarding_prompt_text(gaps_payload)
 
@@ -1402,10 +1695,7 @@ def generate_pass2_semantic_artifacts(
             if isinstance(it, dict):
                 merged_items.append(it)
 
-    # rewrite known false positives caused by prompt coverage
     merged_items = _rewrite_known_false_missing_items(merged_items, repo_paths)
-
-    # keep existing rewrite for 'missing_route' items (but operate on allowed_paths)
     merged_items = _fix_false_missing_route_gap_items(merged_items, allowed_paths)
 
     gaps_out = dict(gaps_raw)
