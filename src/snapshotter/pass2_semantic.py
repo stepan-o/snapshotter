@@ -31,7 +31,7 @@ class SemanticCaps:
     model: str
     max_output_tokens: int
 
-    # input caps (defensive; prevents accidental huge prompts)
+    # input caps (prevents accidental huge prompts)
     max_arch_input_chars: int
     max_arch_files: int
     max_arch_chars_per_file: int
@@ -125,10 +125,7 @@ def _extract_text_from_responses_obj(resp: Any) -> str:
                 if isinstance(c_text, str) and c_text:
                     chunks.append(c_text)
                 elif isinstance(c_text, dict):
-                    try:
-                        chunks.append(json.dumps(c_text, ensure_ascii=False))
-                    except Exception:
-                        pass
+                    chunks.append(json.dumps(c_text, ensure_ascii=False))
 
     return "".join(chunks)
 
@@ -201,6 +198,8 @@ def _try_parse_json(text: str) -> dict[str, Any]:
     if not text:
         raise Pass2SemanticError("OpenAI response was empty; expected a JSON object.")
 
+    # STRICT: expect a single JSON object. We only allow extracting the first object span if the
+    # SDK returns extra wrapping text.
     try:
         obj = json.loads(text)
         if not isinstance(obj, dict):
@@ -209,11 +208,7 @@ def _try_parse_json(text: str) -> dict[str, Any]:
     except Exception:
         candidate = _extract_first_json_object_span(text)
         if not candidate:
-            m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-            if not m:
-                raise Pass2SemanticError(f"OpenAI response was not valid JSON. First 400 chars:\n{text[:400]}")
-            candidate = m.group(0)
-
+            raise Pass2SemanticError(f"OpenAI response was not valid JSON. First 400 chars:\n{text[:400]}")
         obj = json.loads(candidate)
         if not isinstance(obj, dict):
             raise Pass2SemanticError("Salvaged JSON parsed but is not a JSON object.")
@@ -228,9 +223,7 @@ def _build_json_repair_prompt(bad_text: str) -> str:
             "Rules:\n"
             "- Output JSON only. No markdown, no commentary.\n"
             "- Do not change top-level keys or semantics.\n"
-            "- Only fix syntax (missing commas, quotes, escaping, trailing commas, etc.).\n"
-            "- If the input is clearly truncated/incomplete and cannot be repaired losslessly, still output the best-effort JSON object you can, "
-            "but NEVER invent new fields beyond what is implied.\n\n"
+            "- Only fix syntax (missing commas, quotes, escaping, trailing commas, etc.).\n\n"
             "INPUT (verbatim):\n"
             + (bad_text or "")
     )
@@ -254,6 +247,7 @@ def _openai_call_json(*, prompt: str, model: str, max_output_tokens: int, system
     ]
 
     def _responses_create_text(inp: Any) -> str:
+        # Keep a small compatibility shim for SDK arg names; this supports artifact creation.
         last_err: Exception | None = None
         for attempt_kwargs in (
                 {
@@ -301,6 +295,7 @@ def _openai_call_json(*, prompt: str, model: str, max_output_tokens: int, system
                 raw_text=text,
             ) from parse_err
 
+        # Repair is allowed because it increases odds we successfully produce the required artifacts.
         repair_prompt = _build_json_repair_prompt(text)
         repair_input = [
             {"role": "system", "content": "You are a JSON repair tool. Output JSON only."},
@@ -329,53 +324,88 @@ def _openai_call_json(*, prompt: str, model: str, max_output_tokens: int, system
 
 
 # -------------------------------------------------------------------
-# Pass1 -> deterministic facts (presence/signals/deps)
+# Pass1 -> deterministic facts (STRICT CONTRACT)
 # -------------------------------------------------------------------
 
 
+def _require_dict(v: Any, *, name: str) -> dict[str, Any]:
+    if not isinstance(v, dict):
+        raise Pass2SemanticError(f"Pass1 contract violation: expected '{name}' to be a dict.")
+    return v
+
+
+def _require_list(v: Any, *, name: str) -> list[Any]:
+    if not isinstance(v, list):
+        raise Pass2SemanticError(f"Pass1 contract violation: expected '{name}' to be a list.")
+    return v
+
+
+def _require_list_str(v: Any, *, name: str) -> list[str]:
+    lst = _require_list(v, name=name)
+    out: list[str] = []
+    for it in lst:
+        if not isinstance(it, str) or not it.strip():
+            raise Pass2SemanticError(f"Pass1 contract violation: '{name}' must contain non-empty strings.")
+        out.append(it.strip())
+    return out
+
+
 def _repo_paths_set(repo_index: dict[str, Any]) -> set[str]:
+    files = _require_list(repo_index.get("files"), name="repo_index.files")
     s: set[str] = set()
-    for f in repo_index.get("files", []) or []:
-        if isinstance(f, dict):
-            p = f.get("path")
-            if isinstance(p, str) and p:
-                s.add(p)
+    for f in files:
+        if not isinstance(f, dict):
+            raise Pass2SemanticError("Pass1 contract violation: repo_index.files must contain dict entries.")
+        p = f.get("path")
+        if not isinstance(p, str) or not p:
+            raise Pass2SemanticError("Pass1 contract violation: each file must have a non-empty 'path'.")
+        s.add(p)
     return s
 
 
 def _language_by_path_from_repo_index(repo_index: dict[str, Any]) -> dict[str, str]:
+    files = _require_list(repo_index.get("files"), name="repo_index.files")
     out: dict[str, str] = {}
-    for f in repo_index.get("files", []) or []:
+    for f in files:
         if not isinstance(f, dict):
-            continue
+            raise Pass2SemanticError("Pass1 contract violation: repo_index.files must contain dict entries.")
         p = f.get("path")
+        if not isinstance(p, str) or not p:
+            raise Pass2SemanticError("Pass1 contract violation: each file must have a non-empty 'path'.")
         lang = f.get("language")
-        if isinstance(p, str) and p and isinstance(lang, str) and lang:
-            out[p] = lang
+        if lang is None:
+            continue
+        if not isinstance(lang, str) or not lang.strip():
+            raise Pass2SemanticError(f"Pass1 contract violation: language must be a string when present ({p}).")
+        out[p] = lang.strip()
     return out
 
 
 def _signals_from_repo_index(repo_index: dict[str, Any]) -> dict[str, Any]:
-    sig = repo_index.get("signals", {})
-    return sig if isinstance(sig, dict) else {}
+    sig = _require_dict(repo_index.get("signals"), name="repo_index.signals")
+    # we keep this as a loose dict, but do not accept wrong types where we depend on them.
+    return sig
 
 
-def _read_plan_suggestions(repo_index: dict[str, Any]) -> list[str]:
+def _read_plan_candidates(repo_index: dict[str, Any]) -> list[str]:
     """
-    Pass1 emits read_plan_suggestions. Support a few shapes:
-      - list[str]
-      - list[{"path": "..."}]
+    STRICT contract:
+      repo_index["read_plan_suggestions"] is a dict produced by read_plan.suggest_files_to_read
+      and contains:
+        - candidates: list[{"path": str, ...}]
     """
-    v = repo_index.get("read_plan_suggestions")
+    rps = _require_dict(repo_index.get("read_plan_suggestions"), name="repo_index.read_plan_suggestions")
+    cands = _require_list(rps.get("candidates"), name="repo_index.read_plan_suggestions.candidates")
+
     out: list[str] = []
-    if isinstance(v, list):
-        for it in v:
-            if isinstance(it, str) and it.strip():
-                out.append(it.strip())
-            elif isinstance(it, dict):
-                p = it.get("path")
-                if isinstance(p, str) and p.strip():
-                    out.append(p.strip())
+    for it in cands:
+        if not isinstance(it, dict):
+            raise Pass2SemanticError("Pass1 contract violation: candidates must contain dict entries.")
+        p = it.get("path")
+        if not isinstance(p, str) or not p.strip():
+            raise Pass2SemanticError("Pass1 contract violation: candidate.path must be a non-empty string.")
+        out.append(p.strip())
+
     # deterministic unique preserving order
     seen: set[str] = set()
     dedup: list[str] = []
@@ -386,10 +416,34 @@ def _read_plan_suggestions(repo_index: dict[str, Any]) -> list[str]:
     return dedup
 
 
+def _read_plan_closure_seeds(repo_index: dict[str, Any]) -> list[str]:
+    """
+    STRICT contract:
+      repo_index["read_plan_closure_seeds"] is a list[str] emitted by Pass1.
+    """
+    seeds = _require_list_str(repo_index.get("read_plan_closure_seeds"), name="repo_index.read_plan_closure_seeds")
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in seeds:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
 def _extract_pass1_deps(repo_index: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """
-    Canonical extraction based on Pass1 schema:
-      file["deps"] + file["import_edges"] + compat fallback fields.
+    STRICT extraction based on Pass1 schema. No compat fallbacks.
+
+    Required per file:
+      - path: str
+      - deps: dict
+        - import_edges: list[dict]
+          Each edge must include:
+            - spec: str
+            - is_external: bool (or coercible)
+            - if is_external == False: resolved_path: str
+
     Output per file:
       {
         "resolved_internal": set[str],
@@ -400,78 +454,75 @@ def _extract_pass1_deps(repo_index: dict[str, Any]) -> dict[str, dict[str, Any]]
         "top_level_defs": list[str],
       }
     """
+    files = _require_list(repo_index.get("files"), name="repo_index.files")
     out: dict[str, dict[str, Any]] = {}
-    files = repo_index.get("files", []) or []
+
     for f in files:
         if not isinstance(f, dict):
-            continue
+            raise Pass2SemanticError("Pass1 contract violation: repo_index.files must contain dict entries.")
         path = f.get("path")
         if not isinstance(path, str) or not path:
-            continue
+            raise Pass2SemanticError("Pass1 contract violation: each file must have a non-empty 'path'.")
+
+        deps = _require_dict(f.get("deps"), name=f"file.deps ({path})")
+        edges_any = deps.get("import_edges")
+        edges_raw = _require_list(edges_any, name=f"file.deps.import_edges ({path})")
+        import_edges: list[dict[str, Any]] = []
+        for e in edges_raw:
+            if not isinstance(e, dict):
+                raise Pass2SemanticError(f"Pass1 contract violation: import_edges must contain dict entries ({path}).")
+            spec = e.get("spec")
+            if not isinstance(spec, str) or not spec.strip():
+                raise Pass2SemanticError(f"Pass1 contract violation: import edge missing spec ({path}).")
+            import_edges.append(dict(e))
 
         resolved_internal: set[str] = set()
         external_specs: set[str] = set()
-        import_edges: list[dict[str, Any]] = []
+
+        for e in import_edges:
+            is_external = bool(e.get("is_external", False))
+            spec = str(e.get("spec", "")).strip()
+            if is_external:
+                external_specs.add(spec)
+                continue
+            rp = e.get("resolved_path")
+            if not isinstance(rp, str) or not rp.strip():
+                raise Pass2SemanticError(
+                    f"Pass1 contract violation: internal import edge missing resolved_path ({path})."
+                )
+            resolved_internal.add(rp.strip())
+
         flags_set: set[str] = set()
-
-        deps = f.get("deps")
-        if isinstance(deps, dict):
-            internal = deps.get("internal")
-            external = deps.get("external")
-            edges = deps.get("import_edges")
-            if isinstance(internal, list):
-                for x in internal:
-                    if isinstance(x, str) and x.strip():
-                        resolved_internal.add(x.strip())
-            if isinstance(external, list):
-                for x in external:
-                    if isinstance(x, str) and x.strip():
-                        external_specs.add(x.strip())
-            if isinstance(edges, list):
-                for e in edges:
-                    if isinstance(e, dict):
-                        import_edges.append(dict(e))
-
-        if not import_edges:
-            edges2 = f.get("import_edges")
-            if isinstance(edges2, list):
-                for e in edges2:
-                    if isinstance(e, dict):
-                        import_edges.append(dict(e))
-
-        # Fallback old fields if needed
-        if not resolved_internal:
-            v = f.get("imports_resolved_internal")
-            if isinstance(v, list):
-                for x in v:
-                    if isinstance(x, str) and x.strip():
-                        resolved_internal.add(x.strip())
-
-        if not external_specs:
-            v = f.get("imports_external")
-            if isinstance(v, list):
-                for x in v:
-                    if isinstance(x, str) and x.strip():
-                        external_specs.add(x.strip())
-
         fl = f.get("flags")
-        if isinstance(fl, list):
+        if fl is not None:
+            if not isinstance(fl, list):
+                raise Pass2SemanticError(f"Pass1 contract violation: flags must be a list when present ({path}).")
             for x in fl:
-                if isinstance(x, str) and x.strip():
-                    flags_set.add(x.strip())
+                if not isinstance(x, str) or not x.strip():
+                    raise Pass2SemanticError(f"Pass1 contract violation: flags must be non-empty strings ({path}).")
+                flags_set.add(x.strip())
 
-        lang = f.get("language") if isinstance(f.get("language"), str) else None
+        lang = f.get("language")
+        if lang is not None and (not isinstance(lang, str) or not lang.strip()):
+            raise Pass2SemanticError(f"Pass1 contract violation: language must be a string when present ({path}).")
+        lang_str = lang.strip() if isinstance(lang, str) else None
+
         tdefs = f.get("top_level_defs")
         top_defs: list[str] = []
-        if isinstance(tdefs, list):
-            top_defs = [x for x in tdefs if isinstance(x, str) and x.strip()]
+        if tdefs is not None:
+            if not isinstance(tdefs, list):
+                raise Pass2SemanticError(f"Pass1 contract violation: top_level_defs must be a list when present ({path}).")
+            for x in tdefs:
+                if not isinstance(x, str) or not x.strip():
+                    raise Pass2SemanticError(f"Pass1 contract violation: top_level_defs must contain strings ({path}).")
+                top_defs.append(x.strip())
 
         out[path] = {
             "resolved_internal": resolved_internal,
             "external_specs": external_specs,
             "import_edges": import_edges,
             "flags": flags_set,
-            "language": lang,
+            "language": lang_str,
             "top_level_defs": top_defs,
         }
 
@@ -479,10 +530,7 @@ def _extract_pass1_deps(repo_index: dict[str, Any]) -> dict[str, dict[str, Any]]
 
 
 def _known_present_route_hints(repo_paths: set[str]) -> dict[str, Any]:
-    """
-    Tiny, high-signal presence hints to prevent 'not found in snapshot' hallucinations
-    when the file exists but wasn't included in the LLM pack.
-    """
+    # keep: this is deterministic and prevents false "missing from snapshot" claims
     hints: dict[str, Any] = {}
 
     login_files = []
@@ -533,19 +581,13 @@ def _compute_available_dep_graph(
         available_paths: set[str],
         deps_by_file: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    """
-    Returns (out_edges, in_edges) restricted to available_paths only.
-    out_edges[a] = {b} where a imports b (resolved_internal).
-    """
     out_edges: dict[str, set[str]] = {p: set() for p in available_paths}
     in_edges: dict[str, set[str]] = {p: set() for p in available_paths}
 
     for p in available_paths:
-        info = deps_by_file.get(p)
-        if not info:
-            continue
-        for dep in info.get("resolved_internal", set()) or set():
-            if isinstance(dep, str) and dep in available_paths:
+        info = deps_by_file[p]  # STRICT: deps_by_file must cover all pass1 files; available is subset
+        for dep in info["resolved_internal"]:
+            if dep in available_paths:
                 out_edges[p].add(dep)
                 in_edges[dep].add(p)
 
@@ -559,10 +601,6 @@ def _expand_seeds_by_deps(
         hops: int,
         max_added_per_file: int,
 ) -> list[str]:
-    """
-    Deterministic graph expansion: BFS over out_edges for 'hops'.
-    Returns ordered unique list: seeds first, then expansion in sorted order per layer.
-    """
     if hops <= 0:
         return seeds
 
@@ -595,6 +633,66 @@ def _expand_seeds_by_deps(
     return order
 
 
+def _entrypoints_from_signals(repo_index: dict[str, Any], *, available_paths: set[str]) -> list[str]:
+    sig = _signals_from_repo_index(repo_index)
+    eps = sig.get("entrypoints")
+    if eps is None:
+        return []
+    if not isinstance(eps, list):
+        raise Pass2SemanticError("Pass1 contract violation: signals.entrypoints must be a list when present.")
+    out: list[str] = []
+    for it in eps:
+        if not isinstance(it, dict):
+            raise Pass2SemanticError("Pass1 contract violation: signals.entrypoints must contain dict entries.")
+        p = it.get("path")
+        if not isinstance(p, str) or not p.strip():
+            raise Pass2SemanticError("Pass1 contract violation: entrypoint.path must be a non-empty string.")
+        p = p.strip()
+        if p in available_paths:
+            out.append(p)
+    return sorted(set(out))
+
+
+def _candidate_spines_for_known_roots(available_paths: set[str]) -> list[str]:
+    """
+    Deterministic "spine" file hints across known web roots:
+      - frontend/
+      - apps/web/
+      - apps/frontend/
+      - root-level
+    """
+    prefixes = ("", "frontend/", "apps/web/", "apps/frontend/")
+    out: list[str] = []
+
+    def add(p: str) -> None:
+        if p in available_paths and p not in out:
+            out.append(p)
+
+    # web runtime spines
+    for pref in prefixes:
+        add(f"{pref}middleware.ts")
+        add(f"{pref}middleware.js")
+        add(f"{pref}app/layout.tsx")
+        add(f"{pref}app/layout.ts")
+        add(f"{pref}app/page.tsx")
+        add(f"{pref}app/page.ts")
+        add(f"{pref}next.config.ts")
+        add(f"{pref}next.config.js")
+        add(f"{pref}package.json")
+        add(f"{pref}tsconfig.json")
+        add(f"{pref}jsconfig.json")
+
+    # repo-global spines
+    for p in ("pyproject.toml", "uv.lock", "alembic.ini", "package.json", "tsconfig.json", "README.md", "readme.md"):
+        add(p)
+
+    # backend-ish spines (no prefix expansion; backend tends to be root-level)
+    for p in ("backend/main.py", "backend/app.py", "backend/server.py", "backend/security.py", "backend/config.py"):
+        add(p)
+
+    return out
+
+
 def _select_pack_paths_for_architecture(
         *,
         file_contents_map: dict[str, str],
@@ -602,71 +700,38 @@ def _select_pack_paths_for_architecture(
         deps_by_file: dict[str, dict[str, Any]],
         caps: SemanticCaps,
 ) -> tuple[list[str], dict[str, Any]]:
-    """
-    Deterministic pack selection:
-      - Start from pass1 entrypoints + pass1 read_plan_suggestions (intersection with available paths)
-      - Add hard-coded "spines" (frontend layout/middleware, backend main/security/config) if present
-      - Expand by internal deps within available set (bounded by hops + edges per file)
-      - Fill remaining budget by scored ranking (also deterministic)
-    Returns:
-      (ordered_paths, selection_debug)
-    """
     available_paths = set(file_contents_map.keys())
-    sig = _signals_from_repo_index(repo_index)
+    if not available_paths:
+        raise Pass2SemanticError("pass2: file_contents_map is empty; cannot build LLM evidence pack.")
 
-    entrypoints: list[str] = []
-    eps = sig.get("entrypoints")
-    if isinstance(eps, list):
-        for it in eps:
-            if isinstance(it, dict):
-                p = it.get("path")
-                if isinstance(p, str) and p in available_paths:
-                    entrypoints.append(p)
+    entrypoints = _entrypoints_from_signals(repo_index, available_paths=available_paths)
 
-    read_plan = [p for p in _read_plan_suggestions(repo_index) if p in available_paths]
+    closure_seeds = [p for p in _read_plan_closure_seeds(repo_index) if p in available_paths]
+    read_plan = [p for p in _read_plan_candidates(repo_index) if p in available_paths]
 
-    # "spines" (best-effort; only if available)
-    must_consider = [
-        # backend
-        "backend/main.py",
-        "backend/app.py",
-        "backend/server.py",
-        "backend/security.py",
-        "backend/config.py",
-        "backend/db.py",
-        "backend/models.py",
-        # frontend
-        "frontend/middleware.ts",
-        "frontend/middleware.js",
-        "frontend/app/layout.tsx",
-        "frontend/app/layout.ts",
-        "frontend/app/page.tsx",
-        # tooling
-        "pyproject.toml",
-        "frontend/package.json",
-        "package.json",
-        "frontend/tsconfig.json",
-        "tsconfig.json",
-        "frontend/next.config.ts",
-        "frontend/next.config.js",
-        "README.md",
-        "readme.md",
-    ]
-    spines = [p for p in must_consider if p in available_paths]
+    spines = _candidate_spines_for_known_roots(available_paths)
 
-    # seeds: stable order = entrypoints (sorted), then spines (in declared order), then read_plan (in pass1 order)
+    # STRICT seed order (deterministic, dedup, fixed rationale):
+    # 1) closure seeds (highest signal)
+    # 2) read plan candidates (rich coverage)
+    # 3) entrypoints (if not already present)
+    # 4) spines (conventions/config/runtime boundary files)
     seeds: list[str] = []
-    for p in sorted(entrypoints):
-        if p not in seeds:
-            seeds.append(p)
-    for p in spines:
+    for p in closure_seeds:
         if p not in seeds:
             seeds.append(p)
     for p in read_plan:
         if p not in seeds:
             seeds.append(p)
+    for p in entrypoints:
+        if p not in seeds:
+            seeds.append(p)
+    for p in spines:
+        if p not in seeds:
+            seeds.append(p)
 
     out_edges, in_edges = _compute_available_dep_graph(available_paths=available_paths, deps_by_file=deps_by_file)
+
     expanded = _expand_seeds_by_deps(
         seeds=seeds,
         out_edges=out_edges,
@@ -680,19 +745,15 @@ def _select_pack_paths_for_architecture(
         pl = p.lower()
         s = 0
 
-        # Seed boost
-        if p in seeds:
-            s += 1000
-
-        # Entrypoints boost
-        if p in entrypoints:
-            s += 900
-
-        # Read plan boost
+        if p in closure_seeds:
+            s += 1200
         if p in read_plan:
+            s += 900
+        if p in entrypoints:
+            s += 800
+        if p in spines:
             s += 650
 
-        # Core conventions / likely "boundary" files
         if pl.endswith(("main.py", "app.py", "server.py")):
             s += 240
         if pl.endswith(("/route.ts", "/route.js", "/page.tsx", "/layout.tsx")):
@@ -701,36 +762,28 @@ def _select_pack_paths_for_architecture(
             s += 240
         if "security" in pl or "auth" in pl:
             s += 220
-        if "admin" in pl:
-            s += 120
-        if "gate" in pl or "rbac" in pl or "role" in pl or "permission" in pl:
-            s += 120
 
-        # Dependency centrality within available pack
         s += min(80, 10 * len(in_edges.get(p, set())))
         s += min(40, 5 * len(out_edges.get(p, set())))
 
-        # Clusters
         if pl.startswith("backend/routers/"):
             s += 220
         if pl.startswith("backend/"):
             s += 60
         if "/app/api/" in pl and pl.endswith(("/route.ts", "/route.js")):
             s += 180
-        if pl.startswith("frontend/lib/"):
+
+        if pl.startswith(("frontend/lib/", "apps/web/lib/", "apps/frontend/lib/")):
             s += 140
-        if pl.startswith("frontend/components/"):
+        if pl.startswith(("frontend/components/", "apps/web/components/", "apps/frontend/components/")):
             s += 120
 
-        # Docs/config
         if pl.endswith("readme.md") or pl == "readme.md":
             s += 200
         if pl.startswith("docs/"):
             s += 120
         if pl.endswith(("pyproject.toml", "alembic.ini", "package.json", "next.config.ts", "next.config.js")):
             s += 160
-        if pl.endswith(("uv.lock", "package-lock.json", "tsconfig.json", "jsconfig.json")):
-            s += 90
 
         lang = lang_by_path.get(p, "")
         if lang in ("python", "typescript", "javascript"):
@@ -738,8 +791,8 @@ def _select_pack_paths_for_architecture(
 
         return s
 
-    # Ranking: start from expanded (already ordered), then fill by global ranking
     ranked_all = sorted(list(available_paths), key=lambda p: (-score(p), p))
+
     ordered: list[str] = []
     seen: set[str] = set()
 
@@ -755,10 +808,10 @@ def _select_pack_paths_for_architecture(
 
     selection_debug = {
         "available_files": len(available_paths),
-        "seeds_count": len(seeds),
-        "seed_entrypoints": sorted(entrypoints),
-        "seed_spines": spines,
-        "seed_read_plan": read_plan[:40],
+        "closure_seeds_count": len(closure_seeds),
+        "read_plan_count": len(read_plan),
+        "entrypoints_count": len(entrypoints),
+        "spines_count": len(spines),
         "dep_hops": caps.pack_dep_hops,
         "dep_edges_per_file": caps.pack_max_dep_edges_per_file,
         "expanded_count": len(expanded),
@@ -772,15 +825,14 @@ def _build_arch_files_pack(
         file_contents_map: dict[str, str],
         caps: SemanticCaps,
 ) -> dict[str, str]:
-    """
-    Apply caps (files + total chars + per-file chars) to the already-ordered list.
-    """
     out: dict[str, str] = {}
     total = 0
+
     for p in ordered_paths:
         if len(out) >= caps.max_arch_files:
             break
-        c = file_contents_map.get(p, "")
+
+        c = file_contents_map[p]
         if not isinstance(c, str) or not c:
             continue
 
@@ -797,14 +849,15 @@ def _build_arch_files_pack(
         out[p] = c2
         total += len(c2)
 
-    # Floor: ensure some minimum breadth
-    if len(out) < min(12, caps.max_arch_files):
+    # ensure minimum breadth deterministically (still strict, just “fill”)
+    floor = min(12, caps.max_arch_files)
+    if len(out) < floor:
         for p in ordered_paths:
             if len(out) >= min(24, caps.max_arch_files):
                 break
             if p in out:
                 continue
-            c = file_contents_map.get(p, "")
+            c = file_contents_map[p]
             if not isinstance(c, str) or not c:
                 continue
             remaining = caps.max_arch_input_chars - total
@@ -827,80 +880,42 @@ def _select_supporting_files_for_gaps_and_onboarding(
         max_total_chars: int,
         max_chars_per_file: int,
 ) -> dict[str, str]:
-    """
-    Deterministic supporting pack:
-      - Start from read_plan_suggestions (intersection with available)
-      - Add common docs/config/entrypoints
-      - Fill by stable ranking
-    """
     available = set(file_contents_map.keys())
-    sig = _signals_from_repo_index(repo_index)
+    entrypoints = set(_entrypoints_from_signals(repo_index, available_paths=available))
 
-    entrypoints: set[str] = set()
-    eps = sig.get("entrypoints")
-    if isinstance(eps, list):
-        for it in eps:
-            if isinstance(it, dict):
-                p = it.get("path")
-                if isinstance(p, str) and p in available:
-                    entrypoints.add(p)
+    closure_seeds = [p for p in _read_plan_closure_seeds(repo_index) if p in available]
+    read_plan = [p for p in _read_plan_candidates(repo_index) if p in available]
 
-    read_plan = [p for p in _read_plan_suggestions(repo_index) if p in available]
-
-    must = []
-    for p in (
-            "README.md",
-            "readme.md",
-            "pyproject.toml",
-            "uv.lock",
-            "alembic.ini",
-            "package.json",
-            "frontend/package.json",
-            "tsconfig.json",
-            "frontend/tsconfig.json",
-            "frontend/next.config.ts",
-            "frontend/next.config.js",
-            "backend/main.py",
-            "backend/security.py",
-            "backend/config.py",
-            "frontend/middleware.ts",
-            "frontend/app/layout.tsx",
-    ):
-        if p in available:
-            must.append(p)
-
-    keys = sorted(list(available))
+    spines = _candidate_spines_for_known_roots(available)
 
     def score(p: str) -> int:
         pl = p.lower()
         s = 0
+        if p in closure_seeds:
+            s += 1100
         if p in read_plan:
-            s += 800
+            s += 900
         if p in entrypoints:
-            s += 700
+            s += 800
+        if p in spines:
+            s += 650
         if pl.endswith("readme.md") or pl == "readme.md":
             s += 260
         if pl.startswith("docs/") or "/docs/" in pl:
             s += 200
         if pl.endswith(".md"):
             s += 150
-        if pl.endswith(("pyproject.toml", "alembic.ini")):
+        if pl.endswith(("pyproject.toml", "alembic.ini", "uv.lock")):
             s += 140
-        if pl.endswith(("makefile", "uv.lock")):
-            s += 120
         if "next.config" in pl or "eslint" in pl:
             s += 110
-        if pl.endswith(("backend/main.py", "backend/config.py", "backend/security.py")):
-            s += 95
-        if pl.endswith(("frontend/app/layout.tsx", "frontend/middleware.ts")):
-            s += 90
         if pl.endswith(("package.json", "tsconfig.json", "jsconfig.json")):
             s += 85
         if pl.endswith((".ts", ".tsx", ".py")):
             s += 10
         return s
 
-    ranked = sorted(keys, key=lambda p: (-score(p), p))
+    ranked = sorted(list(available), key=lambda p: (-score(p), p))
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -910,9 +925,11 @@ def _select_supporting_files_for_gaps_and_onboarding(
             seen.add(p)
             ordered.append(p)
 
-    for p in must:
+    for p in closure_seeds:
         push(p)
     for p in read_plan:
+        push(p)
+    for p in spines:
         push(p)
     for p in ranked:
         push(p)
@@ -922,7 +939,7 @@ def _select_supporting_files_for_gaps_and_onboarding(
     for p in ordered:
         if len(out) >= max_files:
             break
-        c = file_contents_map.get(p, "")
+        c = file_contents_map[p]
         if not isinstance(c, str) or not c:
             continue
         remaining = max_total_chars - total
@@ -944,16 +961,12 @@ def _deps_hints_for_pack(
         max_internal: int = 10,
         max_external: int = 8,
 ) -> dict[str, Any]:
-    """
-    Tiny, deterministic hints (NOT appendices):
-      per pack file: counts + a few internal deps, a few external specs, plus flags.
-    """
     out: dict[str, Any] = {}
     for p in pack_paths:
-        info = deps_by_file.get(p) or {}
-        internal = sorted([x for x in (info.get("resolved_internal", set()) or set()) if isinstance(x, str)])
-        external = sorted([x for x in (info.get("external_specs", set()) or set()) if isinstance(x, str)])
-        flags = sorted([x for x in (info.get("flags", set()) or set()) if isinstance(x, str)])
+        info = deps_by_file[p]
+        internal = sorted(info["resolved_internal"])
+        external = sorted(info["external_specs"])
+        flags = sorted(info["flags"])
 
         out[p] = {
             "internal_deps_sample": internal[:max_internal],
@@ -990,16 +1003,20 @@ def _build_architecture_payload(
     pack_paths = list(arch_files.keys())
     files_pack: list[dict[str, Any]] = [{"path": p, "content": c} for p, c in arch_files.items()]
 
-    # deterministic, cheap facts
     signals = _signals_from_repo_index(repo_index)
     path_aliases = repo_index.get("path_aliases", {})
     if not isinstance(path_aliases, dict):
-        path_aliases = {}
+        raise Pass2SemanticError("Pass1 contract violation: repo_index.path_aliases must be a dict when present.")
 
     repo_paths = _repo_paths_set(repo_index)
     presence_hints = _known_present_route_hints(repo_paths)
 
     deps_hints = _deps_hints_for_pack(pack_paths=pack_paths, deps_by_file=deps_by_file)
+
+    # include a sample of the plan (contracted shapes only)
+    rps = _require_dict(repo_index.get("read_plan_suggestions"), name="repo_index.read_plan_suggestions")
+    rps_sample = _read_plan_candidates(repo_index)[:40]
+    closure_sample = _read_plan_closure_seeds(repo_index)[:80]
 
     return (
         {
@@ -1027,7 +1044,11 @@ def _build_architecture_payload(
                     "env_vars": signals.get("env_vars", []),
                     "package_json": signals.get("package_json", {}),
                 },
-                "read_plan_suggestions_sample": _read_plan_suggestions(repo_index)[:40],
+                "read_plan": {
+                    "closure_seeds_sample": closure_sample,
+                    "candidates_sample": rps_sample,
+                    "max_files_to_read_default": rps.get("max_files_to_read_default"),
+                },
                 "pack_selection": selection_debug,
             },
             "repo_presence_hints": presence_hints,
@@ -1098,14 +1119,12 @@ def _build_gaps_onboarding_payload(
 
     modules_summary: list[dict[str, Any]] = []
     for m in arch_modules:
-        if not isinstance(m, dict):
-            continue
         modules_summary.append(
             {
                 "name": m.get("name"),
                 "type": m.get("type"),
                 "summary": m.get("summary"),
-                "anchor_paths": m.get("anchor_paths", m.get("evidence_paths", [])),
+                "anchor_paths": m.get("anchor_paths", []),
                 "entrypoints": m.get("entrypoints", []),
                 "where_to_change": m.get("where_to_change", []),
                 "risk_notes": m.get("risk_notes", []),
@@ -1115,10 +1134,7 @@ def _build_gaps_onboarding_payload(
     signals = _signals_from_repo_index(repo_index)
     path_aliases = repo_index.get("path_aliases", {})
     if not isinstance(path_aliases, dict):
-        path_aliases = {}
-
-    env_vars = signals.get("env_vars", [])
-    pkg = signals.get("package_json", {})
+        raise Pass2SemanticError("Pass1 contract violation: repo_index.path_aliases must be a dict when present.")
 
     repo_paths = _repo_paths_set(repo_index)
     presence_hints = _known_present_route_hints(repo_paths)
@@ -1142,16 +1158,16 @@ def _build_gaps_onboarding_payload(
             "path_aliases": path_aliases,
             "signals": {
                 "entrypoints": signals.get("entrypoints", []),
-                "env_vars": env_vars,
-                "package_json": pkg,
+                "env_vars": signals.get("env_vars", []),
+                "package_json": signals.get("package_json", {}),
             },
-            "read_plan_suggestions_sample": _read_plan_suggestions(repo_index)[:40],
+            "read_plan": {
+                "closure_seeds_sample": _read_plan_closure_seeds(repo_index)[:80],
+                "candidates_sample": _read_plan_candidates(repo_index)[:40],
+            },
         },
         "repo_presence_hints": presence_hints,
-        "architecture_summary": {
-            "modules": modules_summary,
-            "uncertainties": arch_uncertainties,
-        },
+        "architecture_summary": {"modules": modules_summary, "uncertainties": arch_uncertainties},
         "deterministic_gaps_already_found": deterministic_gap_items,
         "supporting_files": [{"path": p, "content": c} for p, c in support_files.items()],
         "output_contract": {
@@ -1192,17 +1208,8 @@ def _derive_deps_from_anchor_paths(
         modules: list[dict[str, Any]],
         deps_by_file: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """
-    Deterministically attach dependencies to modules from pass1 deps_by_file, based on anchor_paths.
-
-    deps = sorted(unique internal repo paths) + sorted(unique external specs)
-
-    Also sets evidence_paths := anchor_paths for downstream compatibility.
-    """
     for m in modules:
         anchors = m.get("anchor_paths")
-        if not isinstance(anchors, list):
-            anchors = m.get("evidence_paths")
         if not isinstance(anchors, list):
             anchors = []
         anchors = [p for p in anchors if isinstance(p, str) and p.strip()]
@@ -1213,11 +1220,11 @@ def _derive_deps_from_anchor_paths(
             info = deps_by_file.get(p)
             if not info:
                 continue
-            internal |= set(info.get("resolved_internal", set()) or [])
-            external |= set(info.get("external_specs", set()) or [])
+            internal |= set(info["resolved_internal"])
+            external |= set(info["external_specs"])
 
         m["anchor_paths"] = anchors
-        m["evidence_paths"] = list(anchors)  # compat
+        m["evidence_paths"] = list(anchors)  # compat name for downstream consumers
         m["dependencies"] = sorted(internal) + sorted(external)
 
     return modules
@@ -1230,7 +1237,7 @@ def _derive_deps_from_anchor_paths(
 
 def _deterministic_gap_scan(repo_index: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    files = repo_index.get("files", []) or []
+    files = _require_list(repo_index.get("files"), name="repo_index.files")
     sig = _signals_from_repo_index(repo_index)
 
     unresolved_paths: list[str] = []
@@ -1238,16 +1245,20 @@ def _deterministic_gap_scan(repo_index: dict[str, Any]) -> list[dict[str, Any]]:
 
     for f in files:
         if not isinstance(f, dict):
-            continue
+            raise Pass2SemanticError("Pass1 contract violation: repo_index.files must contain dict entries.")
         p = f.get("path")
-        flags = f.get("flags")
         if not isinstance(p, str) or not p:
+            raise Pass2SemanticError("Pass1 contract violation: each file must have a non-empty 'path'.")
+        flags = f.get("flags")
+        if flags is None:
             continue
-        if isinstance(flags, list):
-            if "import_unresolved" in flags:
-                unresolved_paths.append(p)
-            if "python_parse_failed" in flags or "js_ts_parse_failed" in flags:
-                parse_failed.append(p)
+        if not isinstance(flags, list):
+            raise Pass2SemanticError(f"Pass1 contract violation: flags must be a list when present ({p}).")
+        flags_s = [x for x in flags if isinstance(x, str)]
+        if "import_unresolved" in flags_s:
+            unresolved_paths.append(p)
+        if "python_parse_failed" in flags_s or "js_ts_parse_failed" in flags_s:
+            parse_failed.append(p)
 
     if unresolved_paths:
         items.append(
@@ -1274,8 +1285,8 @@ def _deterministic_gap_scan(repo_index: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
 
-    eps = sig.get("entrypoints", [])
-    if not isinstance(eps, list) or len(eps) == 0:
+    eps = sig.get("entrypoints")
+    if eps is not None and (not isinstance(eps, list) or len(eps) == 0):
         items.append(
             {
                 "type": "no_entrypoints_detected",
@@ -1315,7 +1326,7 @@ def _post_enforce_architecture_constraints(
                 out_uncertainties.append(u)
 
     if not isinstance(modules, list):
-        modules = []
+        raise Pass2SemanticError("Pass2 LLM contract violation: 'modules' must be a list.")
 
     for i, m in enumerate(modules):
         if not isinstance(m, dict):
@@ -1337,7 +1348,6 @@ def _post_enforce_architecture_constraints(
         if not isinstance(anchors, list):
             anchors = []
         anchors = [p for p in anchors if isinstance(p, str) and p in allowed_paths]
-
         if len(anchors) > 10:
             anchors = anchors[:10]
         mm["anchor_paths"] = anchors
@@ -1362,7 +1372,10 @@ def _post_enforce_architecture_constraints(
             out_uncertainties.append(
                 {
                     "type": "ungrounded_module",
-                    "description": f"Module '{mm.get('name','unknown')}' lacks anchor_paths in files_read; summary/responsibilities set to unknown.",
+                    "description": (
+                        f"Module '{mm.get('name','unknown')}' lacks anchor_paths in files_read; "
+                        "summary/responsibilities set to unknown."
+                    ),
                     "files_involved": [],
                     "suggested_questions": ["Which files define this module? Add representative files to pass2 selection."],
                 }
@@ -1379,9 +1392,9 @@ def _post_enforce_architecture_constraints(
                     }
                 )
 
-        # Do NOT accept deps from LLM output
+        # Do NOT accept deps from LLM output (deterministic derivation later)
         mm["dependencies"] = []
-        mm["evidence_paths"] = list(anchors)  # compat (populated later too)
+        mm["evidence_paths"] = list(anchors)  # compat (filled again later)
 
         out_modules.append(mm)
 
@@ -1395,13 +1408,13 @@ def _post_enforce_architecture_constraints(
 
 def _normalize_gaps_object(gaps: Any, *, job_id: str) -> dict[str, Any]:
     if not isinstance(gaps, dict):
-        gaps = {}
+        raise Pass2SemanticError("Pass2 LLM contract violation: 'gaps' must be an object.")
     out = dict(gaps)
     out.setdefault("generated_at", None)
     out["job_id"] = job_id
     items = out.get("items")
     if not isinstance(items, list):
-        items = []
+        raise Pass2SemanticError("Pass2 LLM contract violation: gaps.items must be a list.")
     cleaned: list[dict[str, Any]] = []
     for it in items:
         if isinstance(it, dict):
@@ -1437,10 +1450,6 @@ def _dedupe_gap_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _fix_false_missing_route_gap_items(items: list[dict[str, Any]], allowed_paths: set[str]) -> list[dict[str, Any]]:
-    """
-    If an item claims route/docs missing but those referenced files exist (in allowed_paths),
-    rewrite it to a check-style item instead of 'missing'.
-    """
     out: list[dict[str, Any]] = []
     for it in items:
         if not isinstance(it, dict):
@@ -1465,131 +1474,6 @@ def _fix_false_missing_route_gap_items(items: list[dict[str, Any]], allowed_path
     return out
 
 
-def _rewrite_known_false_missing_items(items: list[dict[str, Any]], repo_paths: set[str]) -> list[dict[str, Any]]:
-    """
-    Downgrade/convert known false positives caused by prompt coverage rather than repo reality,
-    notably /login and /case-studies.
-    """
-    has_login = ("frontend/app/login/page.tsx" in repo_paths) or ("frontend/app/login/LoginPageClient.tsx" in repo_paths)
-    has_case_studies = "frontend/app/case-studies/page.tsx" in repo_paths
-
-    out: list[dict[str, Any]] = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        desc = (it.get("description") or "")
-        desc_l = desc.lower()
-        t = (it.get("type") or "").strip()
-
-        def _files_list() -> list[str]:
-            fi = it.get("files_involved")
-            if not isinstance(fi, list):
-                return []
-            return [p for p in fi if isinstance(p, str) and p]
-
-        if has_login and ("/login" in desc_l or "login page" in desc_l):
-            if "not found" in desc_l or "no route" in desc_l or "missing" in desc_l or t in (
-                    "incomplete_extraction",
-                    "missing_docs",
-            ):
-                it2 = dict(it)
-                it2["type"] = "prompt_coverage_gap"
-                it2["severity"] = "low"
-                it2["description"] = (
-                    "Login route exists in snapshot (frontend/app/login/page.tsx + LoginPageClient.tsx). "
-                    "Prior pass likely omitted these files from the LLM evidence pack; treat as prompt coverage issue, not missing implementation."
-                )
-                files = _files_list()
-                for p in ("frontend/app/login/page.tsx", "frontend/app/login/LoginPageClient.tsx"):
-                    if p in repo_paths and p not in files:
-                        files.append(p)
-                it2["files_involved"] = files
-                out.append(it2)
-                continue
-
-        if has_case_studies and ("/case-studies" in desc_l or "case studies" in desc_l):
-            if "not found" in desc_l or "no route" in desc_l or "missing" in desc_l or t in (
-                    "missing_docs",
-                    "incomplete_extraction",
-            ):
-                it2 = dict(it)
-                it2["type"] = "prompt_coverage_gap"
-                it2["severity"] = "low"
-                it2["description"] = (
-                    "Case studies route exists in snapshot (frontend/app/case-studies/page.tsx). "
-                    "Prior pass likely omitted this file from the LLM evidence pack; treat as prompt coverage issue, not missing route."
-                )
-                files = _files_list()
-                if "frontend/app/case-studies/page.tsx" not in files:
-                    files.append("frontend/app/case-studies/page.tsx")
-                it2["files_involved"] = files
-                out.append(it2)
-                continue
-
-        out.append(it)
-
-    return out
-
-
-def _rewrite_known_false_missing_uncertainties(uncertainties: list[dict[str, Any]], repo_paths: set[str]) -> list[dict[str, Any]]:
-    """
-    Same as gaps rewrite but for architecture 'uncertainties' objects.
-    """
-    has_login = ("frontend/app/login/page.tsx" in repo_paths) or ("frontend/app/login/LoginPageClient.tsx" in repo_paths)
-    has_case_studies = "frontend/app/case-studies/page.tsx" in repo_paths
-
-    out: list[dict[str, Any]] = []
-    for u in uncertainties:
-        if not isinstance(u, dict):
-            continue
-        desc = (u.get("description") or "")
-        desc_l = desc.lower()
-
-        files_involved = u.get("files_involved")
-        if not isinstance(files_involved, list):
-            files_involved = []
-        files_involved = [p for p in files_involved if isinstance(p, str) and p]
-
-        if has_login and ("/login" in desc_l or "login page" in desc_l) and ("not found" in desc_l or "unknown" in desc_l):
-            u2 = dict(u)
-            u2["type"] = "prompt_coverage_gap"
-            u2["description"] = (
-                "Login route exists in snapshot (frontend/app/login/page.tsx + LoginPageClient.tsx). "
-                "If this was flagged as missing/unknown, it was likely not included in the provided file contents."
-            )
-            for p in ("frontend/app/login/page.tsx", "frontend/app/login/LoginPageClient.tsx"):
-                if p in repo_paths and p not in files_involved:
-                    files_involved.append(p)
-            u2["files_involved"] = files_involved
-            u2["suggested_questions"] = [
-                "Ensure login route files are included in pass2 selection and cited as anchor_paths where relevant."
-            ]
-            out.append(u2)
-            continue
-
-        if has_case_studies and ("/case-studies" in desc_l or "case studies" in desc_l) and (
-                "not found" in desc_l or "unknown" in desc_l
-        ):
-            u2 = dict(u)
-            u2["type"] = "prompt_coverage_gap"
-            u2["description"] = (
-                "Case studies route exists in snapshot (frontend/app/case-studies/page.tsx). "
-                "If this was flagged as missing/unknown, it was likely not included in the provided file contents."
-            )
-            if "frontend/app/case-studies/page.tsx" not in files_involved:
-                files_involved.append("frontend/app/case-studies/page.tsx")
-            u2["files_involved"] = files_involved
-            u2["suggested_questions"] = [
-                "Ensure case-studies route file is included in pass2 selection and cited where navigation references it."
-            ]
-            out.append(u2)
-            continue
-
-        out.append(u)
-
-    return out
-
-
 # -------------------------------------------------------------------
 # Public API
 # -------------------------------------------------------------------
@@ -1606,13 +1490,17 @@ def generate_pass2_semantic_artifacts(
         file_contents_map: dict[str, str],
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
     """
-    Behavior:
+    Contracted behavior:
       - Pass2 LLM outputs ONLY: semantic modules + anchor_paths + short semantics
       - evidence_paths and dependencies are derived deterministically from pass1 after the fact
-      - bounded read pack is selected deterministically from pass1 facts (entrypoints + read_plan + deps expansion),
-        but constrained to the actually provided file_contents_map (no hidden reads)
+      - bounded read pack is selected deterministically from pass1 facts (closure seeds + read plan + deps expansion),
+        constrained to provided file_contents_map (no hidden reads)
     """
     caps = _semantic_caps_from_env()
+
+    # STRICT: validate contract essentials early
+    _ = _read_plan_closure_seeds(repo_index)
+    _ = _read_plan_candidates(repo_index)
 
     deps_by_file = _extract_pass1_deps(repo_index)
 
@@ -1641,16 +1529,13 @@ def generate_pass2_semantic_artifacts(
     repo_paths = _repo_paths_set(repo_index)
 
     enforced_modules, enforced_uncertainties = _post_enforce_architecture_constraints(
-        modules=arch_obj.get("modules", []),
+        modules=arch_obj.get("modules"),
         uncertainties=arch_obj.get("uncertainties", []),
         allowed_paths=allowed_paths,
     )
 
     # deterministically attach deps (and evidence_paths := anchor_paths for compat)
     enforced_modules = _derive_deps_from_anchor_paths(enforced_modules, deps_by_file)
-
-    # rewrite known false-positive uncertainties (prompt coverage vs repo reality)
-    enforced_uncertainties = _rewrite_known_false_missing_uncertainties(enforced_uncertainties, repo_paths)
 
     arch_out: dict[str, Any] = {"modules": enforced_modules, "uncertainties": enforced_uncertainties}
 
@@ -1684,28 +1569,23 @@ def generate_pass2_semantic_artifacts(
     )
 
     gaps_raw = _normalize_gaps_object(gaps_obj.get("gaps"), job_id=job_id)
-    onboarding_md = gaps_obj.get("onboarding_md") or ""
+    onboarding_md = gaps_obj.get("onboarding_md")
+    if onboarding_md is None:
+        onboarding_md = ""
+    if not isinstance(onboarding_md, str):
+        raise Pass2SemanticError("Pass2 LLM contract violation: onboarding_md must be a string.")
     if not caps.onboarding_enabled:
         onboarding_md = ""
 
     merged_items = list(deterministic_gap_items)
-    llm_items = gaps_raw.get("items", [])
-    if isinstance(llm_items, list):
-        for it in llm_items:
-            if isinstance(it, dict):
-                merged_items.append(it)
+    for it in gaps_raw["items"]:
+        if isinstance(it, dict):
+            merged_items.append(it)
 
-    merged_items = _rewrite_known_false_missing_items(merged_items, repo_paths)
+    # keep: correctness over “missing” language if file was present in pack
     merged_items = _fix_false_missing_route_gap_items(merged_items, allowed_paths)
 
     gaps_out = dict(gaps_raw)
     gaps_out["items"] = _dedupe_gap_items(merged_items)
-
-    if not isinstance(onboarding_md, str):
-        raise Pass2SemanticError("onboarding_md is not a string after processing.")
-    if not isinstance(gaps_out, dict):
-        raise Pass2SemanticError("gaps output has invalid type.")
-    if not isinstance(arch_out, dict):
-        raise Pass2SemanticError("architecture output has invalid type.")
 
     return arch_out, gaps_out, onboarding_md
