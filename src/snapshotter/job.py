@@ -1,9 +1,11 @@
-import secrets
+# src/snapshotter/job.py
+from __future__ import annotations
+
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from snapshotter.utils import repo_slug_from_url, utc_ts
+from snapshotter.utils import repo_slug_from_url, stable_json_fingerprint_sha256, utc_ts
 
 
 class Limits(BaseModel):
@@ -55,16 +57,26 @@ class Job(BaseModel):
     repo_slug: str | None = None
     timestamp_utc: str | None = None
 
-    def finalize(self):
+    def finalize(self) -> "Job":
+        """
+        Contract:
+        - No randomness.
+        - If job_id is not provided, derive a deterministic id from the job's canonical content.
+        - timestamp_utc may vary per run, but identity (job_id) must not.
+        """
         self.repo_slug = repo_slug_from_url(self.repo_url)
         self.timestamp_utc = utc_ts()
 
-        # IMPORTANT:
-        # timestamp_utc is already a path segment, so job_id must NOT equal timestamp_utc
-        # or you get out/<ts>/<ts> and s3/<ts>/<ts>.
         if not self.job_id:
-            # short-ish, unique per run; stable enough for v0.1
-            self.job_id = f"{self.timestamp_utc}-{secrets.token_hex(4)}"
+            # Deterministic: stable fingerprint of the canonical job content.
+            # We fingerprint THIS model's data; timestamp_utc/repo_slug are not set yet when dumping here.
+            # If callers pre-populate derived fields anyway, the default volatile set strips them.
+            fp = stable_json_fingerprint_sha256(self.model_dump(mode="python"))
+            self.job_id = fp[:12]
+
+        # Guardrail: avoid accidental path duplication if someone set job_id equal to timestamp.
+        if self.timestamp_utc and self.job_id == self.timestamp_utc:
+            raise ValueError("job_id must not equal timestamp_utc (would duplicate path segments).")
 
         return self
 
