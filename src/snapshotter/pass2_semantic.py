@@ -5,7 +5,57 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from snapshotter.job import Job
+from snapshotter.utils import sha256_bytes, utc_ts
+
+# --------------------------------------------------------------------------------------
+# Pass 2 Semantic Contract (LOCKED, strict; aligned with pass1.py)
+#
+# Inputs (STRICT):
+# - pass1_repo_index MUST be the dict produced by pass1.build_repo_index / pass1.generate_pass1_artifacts
+# - We DO NOT accept legacy/back-compat shapes (no alternate field names).
+#
+# Pass1 -> Pass2 schema assumptions (STRICT):
+# - pass1_repo_index["schema_version"] == "pass1_repo_index.v1"
+# - pass1_repo_index["job"]["resolved_commit"] is present and not "unknown"
+# - pass1_repo_index["files"] is a list of dicts, each with:
+#     - path: str
+#     - deps: dict with:
+#         - import_edges: list[dict] (may be empty)
+#           * Each edge MUST contain:
+#               - kind: str
+#               - spec: str
+#               - lineno: int
+#               - resolved_path: str
+#               - is_external: False
+#         - internal_unresolved_specs: list[str] (may be empty)
+#
+# Caps source of truth (aligned with Pass1 read-plan cap rule):
+# - Pass2 caps come from Job.pass2.* (primary).
+# - Environment variables are allowed ONLY as a temporary back-compat shim when Job schema
+#   does not yet contain the field (mirrors pass1.py fallback pattern). No multi-location probing.
+#
+# Outputs (LOCKED):
+# - PASS2_SEMANTIC.json         (model output + pack fingerprints + strict metadata)
+# - PASS2_ARCH_PACK.json        (bounded architecture evidence pack: path->content)
+# - PASS2_SUPPORT_PACK.json     (bounded supporting pack: path->content)
+# - PASS2_LLM_RAW.txt           (raw model text for inspection on failure)
+# - PASS2_LLM_REPAIRED.txt      (optional: repaired JSON text if repair was used)
+# --------------------------------------------------------------------------------------
+
+PASS2_SEMANTIC_FILENAME = "PASS2_SEMANTIC.json"
+PASS2_ARCH_PACK_FILENAME = "PASS2_ARCH_PACK.json"
+PASS2_SUPPORT_PACK_FILENAME = "PASS2_SUPPORT_PACK.json"
+PASS2_LLM_RAW_FILENAME = "PASS2_LLM_RAW.txt"
+PASS2_LLM_REPAIRED_FILENAME = "PASS2_LLM_REPAIRED.txt"
+
+PASS1_REPO_INDEX_SCHEMA_VERSION = "pass1_repo_index.v1"
+PASS2_SEMANTIC_SCHEMA_VERSION = "pass2_semantic.v1"
+PASS2_ARCH_PACK_SCHEMA_VERSION = "pass2_arch_pack.v1"
+PASS2_SUPPORT_PACK_SCHEMA_VERSION = "pass2_support_pack.v1"
 
 
 class Pass2SemanticError(RuntimeError):
@@ -46,6 +96,11 @@ class SemanticCaps:
     pack_max_dep_edges_per_file: int
 
 
+# -------------------------------------------------------------------
+# Caps: Job-first (aligned), env-only fallback for missing Job fields
+# -------------------------------------------------------------------
+
+
 def _bool_from_env(name: str, default: bool) -> bool:
     v = os.environ.get(name, "").strip()
     if not v:
@@ -63,34 +118,97 @@ def _int_from_env(name: str, default: int) -> int:
         return default
 
 
-def _semantic_caps_from_env() -> SemanticCaps:
-    onboarding_enabled = _bool_from_env("SNAPSHOTTER_PASS2_ONBOARDING", True)
-    model = os.environ.get("SNAPSHOTTER_LLM_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
-    max_output_tokens = _int_from_env("SNAPSHOTTER_LLM_MAX_OUTPUT_TOKENS", 2000)
+def _job_get(job: Job, dotted: str) -> Any:
+    cur: Any = job
+    for part in dotted.split("."):
+        if cur is None:
+            return None
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            cur = getattr(cur, part, None)
+    return cur
 
-    max_arch_input_chars = _int_from_env("SNAPSHOTTER_PASS2_MAX_ARCH_INPUT_CHARS", 240_000)
-    max_arch_files = _int_from_env("SNAPSHOTTER_PASS2_MAX_ARCH_FILES", 120)
-    max_arch_chars_per_file = _int_from_env("SNAPSHOTTER_PASS2_MAX_ARCH_CHARS_PER_FILE", 9000)
 
-    max_support_files = _int_from_env("SNAPSHOTTER_PASS2_MAX_SUPPORT_FILES", 28)
-    max_support_chars = _int_from_env("SNAPSHOTTER_PASS2_MAX_SUPPORT_CHARS", 120_000)
-    max_support_chars_per_file = _int_from_env("SNAPSHOTTER_PASS2_MAX_SUPPORT_CHARS_PER_FILE", 9000)
+def _caps_from_job_or_env(job: Job) -> SemanticCaps:
+    """
+    Contract alignment with pass1.py:
+    - Prefer Job.pass2.* as the only intended cap source.
+    - Env vars are used ONLY as fallback when the Job schema doesn't yet expose the field.
+    """
+    # Defaults are deliberately consistent with prior behavior.
+    def b(field: str, env: str, default: bool) -> bool:
+        v = _job_get(job, field)
+        if isinstance(v, bool):
+            return v
+        # fallback only if absent / wrong type
+        return _bool_from_env(env, default)
 
-    pack_dep_hops = _int_from_env("SNAPSHOTTER_PASS2_PACK_DEP_HOPS", 1)
-    pack_max_dep_edges_per_file = _int_from_env("SNAPSHOTTER_PASS2_PACK_MAX_DEP_EDGES_PER_FILE", 12)
+    def i(field: str, env: str, default: int) -> int:
+        v = _job_get(job, field)
+        try:
+            if v is not None:
+                n = int(v)
+                return n
+        except Exception:
+            pass
+        return _int_from_env(env, default)
+
+    def s(field: str, env: str, default: str) -> str:
+        v = _job_get(job, field)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        w = os.environ.get(env, "").strip()
+        return w or default
+
+    onboarding_enabled = b("pass2.onboarding_enabled", "SNAPSHOTTER_PASS2_ONBOARDING", True)
+    model = s("pass2.model", "SNAPSHOTTER_LLM_MODEL", "gpt-4.1-mini")
+    max_output_tokens = i("pass2.max_output_tokens", "SNAPSHOTTER_LLM_MAX_OUTPUT_TOKENS", 2000)
+
+    max_arch_input_chars = i("pass2.max_arch_input_chars", "SNAPSHOTTER_PASS2_MAX_ARCH_INPUT_CHARS", 240_000)
+    max_arch_files = i("pass2.max_files", "SNAPSHOTTER_PASS2_MAX_ARCH_FILES", 120)
+    max_arch_chars_per_file = i("pass2.max_arch_chars_per_file", "SNAPSHOTTER_PASS2_MAX_ARCH_CHARS_PER_FILE", 9000)
+
+    max_support_files = i("pass2.max_support_files", "SNAPSHOTTER_PASS2_MAX_SUPPORT_FILES", 28)
+    max_support_chars = i("pass2.max_support_chars", "SNAPSHOTTER_PASS2_MAX_SUPPORT_CHARS", 120_000)
+    max_support_chars_per_file = i(
+        "pass2.max_support_chars_per_file",
+        "SNAPSHOTTER_PASS2_MAX_SUPPORT_CHARS_PER_FILE",
+        9000,
+    )
+
+    pack_dep_hops = i("pass2.pack_dep_hops", "SNAPSHOTTER_PASS2_PACK_DEP_HOPS", 1)
+    pack_max_dep_edges_per_file = i(
+        "pass2.pack_max_dep_edges_per_file",
+        "SNAPSHOTTER_PASS2_PACK_MAX_DEP_EDGES_PER_FILE",
+        12,
+    )
+
+    # guardrails (deterministic clamping)
+    max_output_tokens = max(256, min(max_output_tokens, 20_000))
+    max_arch_files = max(1, min(max_arch_files, 240))
+    max_arch_input_chars = max(10_000, min(max_arch_input_chars, 500_000))
+    max_arch_chars_per_file = max(500, min(max_arch_chars_per_file, 60_000))
+
+    max_support_files = max(1, min(max_support_files, 120))
+    max_support_chars = max(5_000, min(max_support_chars, 300_000))
+    max_support_chars_per_file = max(500, min(max_support_chars_per_file, 60_000))
+
+    pack_dep_hops = max(0, min(pack_dep_hops, 4))
+    pack_max_dep_edges_per_file = max(0, min(pack_max_dep_edges_per_file, 100))
 
     return SemanticCaps(
-        onboarding_enabled=onboarding_enabled,
+        onboarding_enabled=bool(onboarding_enabled),
         model=model,
-        max_output_tokens=max_output_tokens,
-        max_arch_input_chars=max_arch_input_chars,
-        max_arch_files=max_arch_files,
-        max_arch_chars_per_file=max_arch_chars_per_file,
-        max_support_files=max_support_files,
-        max_support_chars=max_support_chars,
-        max_support_chars_per_file=max_support_chars_per_file,
-        pack_dep_hops=pack_dep_hops,
-        pack_max_dep_edges_per_file=pack_max_dep_edges_per_file,
+        max_output_tokens=int(max_output_tokens),
+        max_arch_input_chars=int(max_arch_input_chars),
+        max_arch_files=int(max_arch_files),
+        max_arch_chars_per_file=int(max_arch_chars_per_file),
+        max_support_files=int(max_support_files),
+        max_support_chars=int(max_support_chars),
+        max_support_chars_per_file=int(max_support_chars_per_file),
+        pack_dep_hops=int(pack_dep_hops),
+        pack_max_dep_edges_per_file=int(pack_max_dep_edges_per_file),
     )
 
 
@@ -198,8 +316,8 @@ def _try_parse_json(text: str) -> dict[str, Any]:
     if not text:
         raise Pass2SemanticError("OpenAI response was empty; expected a JSON object.")
 
-    # STRICT: expect a single JSON object. We only allow extracting the first object span if the
-    # SDK returns extra wrapping text.
+    # STRICT: expect a single JSON object. Allow extracting the first object span only if
+    # the SDK returns extra wrapper text.
     try:
         obj = json.loads(text)
         if not isinstance(obj, dict):
@@ -229,7 +347,7 @@ def _build_json_repair_prompt(bad_text: str) -> str:
     )
 
 
-def _openai_call_json(*, prompt: str, model: str, max_output_tokens: int, system: str) -> dict[str, Any]:
+def _openai_call_json(*, prompt: str, model: str, max_output_tokens: int, system: str) -> tuple[dict[str, Any], str, str | None]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise Pass2SemanticError("OPENAI_API_KEY is not set; cannot run pass2 semantic generation.")
@@ -247,7 +365,6 @@ def _openai_call_json(*, prompt: str, model: str, max_output_tokens: int, system
     ]
 
     def _responses_create_text(inp: Any) -> str:
-        # Keep a small compatibility shim for SDK arg names; this supports artifact creation.
         last_err: Exception | None = None
         for attempt_kwargs in (
                 {
@@ -278,25 +395,27 @@ def _openai_call_json(*, prompt: str, model: str, max_output_tokens: int, system
                 continue
         raise Pass2SemanticError(f"OpenAI Responses API call failed due to incompatible SDK args: {last_err}")
 
+    raw_text: str
     try:
-        text = _responses_create_text(input_payload)
+        raw_text = _responses_create_text(input_payload)
     except Exception as e:
         raise Pass2SemanticError(f"OpenAI Responses API call failed: {e}") from e
 
     try:
-        return _try_parse_json(text)
+        obj = _try_parse_json(raw_text)
+        return obj, raw_text, None
     except Exception as parse_err:
-        if _looks_truncated(text):
+        if _looks_truncated(raw_text):
             raise Pass2SemanticLLMOutputError(
                 "OpenAI returned truncated/incomplete JSON (likely hit max output tokens). "
-                "Increase SNAPSHOTTER_LLM_MAX_OUTPUT_TOKENS and retry.\n"
+                "Increase pass2.max_output_tokens (Job) and retry.\n"
                 f"Parse error: {parse_err}\n"
-                f"First 400 chars:\n{text[:400]}",
-                raw_text=text,
+                f"First 400 chars:\n{raw_text[:400]}",
+                raw_text=raw_text,
             ) from parse_err
 
-        # Repair is allowed because it increases odds we successfully produce the required artifacts.
-        repair_prompt = _build_json_repair_prompt(text)
+        # Repair allowed (artifact salvage).
+        repair_prompt = _build_json_repair_prompt(raw_text)
         repair_input = [
             {"role": "system", "content": "You are a JSON repair tool. Output JSON only."},
             {"role": "user", "content": repair_prompt},
@@ -308,23 +427,24 @@ def _openai_call_json(*, prompt: str, model: str, max_output_tokens: int, system
         except Exception as e:
             raise Pass2SemanticLLMOutputError(
                 "OpenAI JSON repair call failed.\n"
-                f"First 400 chars of original:\n{text[:400]}",
-                raw_text=text,
+                f"First 400 chars of original:\n{raw_text[:400]}",
+                raw_text=raw_text,
             ) from e
 
         try:
-            return _try_parse_json(repaired_text)
+            obj2 = _try_parse_json(repaired_text)
+            return obj2, raw_text, repaired_text
         except Exception as e:
             raise Pass2SemanticLLMOutputError(
                 "Failed to parse OpenAI JSON response (including repair attempt).\n"
-                f"Original first 400 chars:\n{text[:400]}",
-                raw_text=text,
+                f"Original first 400 chars:\n{raw_text[:400]}",
+                raw_text=raw_text,
                 repaired_text=repaired_text,
             ) from e
 
 
 # -------------------------------------------------------------------
-# Pass1 -> deterministic facts (STRICT CONTRACT)
+# Pass1 contract validation + strict extractors
 # -------------------------------------------------------------------
 
 
@@ -348,6 +468,51 @@ def _require_list_str(v: Any, *, name: str) -> list[str]:
             raise Pass2SemanticError(f"Pass1 contract violation: '{name}' must contain non-empty strings.")
         out.append(it.strip())
     return out
+
+
+def _assert_pass1_repo_index_contract(repo_index: dict[str, Any]) -> None:
+    if not isinstance(repo_index, dict):
+        raise Pass2SemanticError("Pass1 contract violation: repo_index must be a dict.")
+
+    if repo_index.get("schema_version") != PASS1_REPO_INDEX_SCHEMA_VERSION:
+        raise Pass2SemanticError("Pass1 contract violation: repo_index.schema_version mismatch.")
+
+    job = _require_dict(repo_index.get("job"), name="repo_index.job")
+    rc = job.get("resolved_commit")
+    if not isinstance(rc, str) or not rc.strip() or rc.strip() == "unknown":
+        raise Pass2SemanticError("Pass1 contract violation: job.resolved_commit missing/invalid.")
+
+    rp = _require_dict(repo_index.get("read_plan"), name="repo_index.read_plan")
+    _require_list_str(rp.get("closure_seeds"), name="repo_index.read_plan.closure_seeds")
+    _require_list(rp.get("candidates"), name="repo_index.read_plan.candidates")
+
+    files = _require_list(repo_index.get("files"), name="repo_index.files")
+    for f in files:
+        if not isinstance(f, dict):
+            raise Pass2SemanticError("Pass1 contract violation: repo_index.files must contain dict entries.")
+        path = f.get("path")
+        if not isinstance(path, str) or not path:
+            raise Pass2SemanticError("Pass1 contract violation: each file must have non-empty 'path'.")
+        deps = _require_dict(f.get("deps"), name=f"file.deps ({path})")
+        edges = _require_list(deps.get("import_edges"), name=f"file.deps.import_edges ({path})")
+        for e in edges:
+            if not isinstance(e, dict):
+                raise Pass2SemanticError(f"Pass1 contract violation: import_edges must contain dict entries ({path}).")
+            spec = e.get("spec")
+            if not isinstance(spec, str) or not spec.strip():
+                raise Pass2SemanticError(f"Pass1 contract violation: import edge missing spec ({path}).")
+            # Pass1 guarantees internal edges only and is_external=False
+            if bool(e.get("is_external", False)) is not False:
+                raise Pass2SemanticError(f"Pass1 contract violation: import edge is_external must be False ({path}).")
+            rp2 = e.get("resolved_path")
+            if not isinstance(rp2, str) or not rp2.strip():
+                raise Pass2SemanticError(f"Pass1 contract violation: internal edge missing resolved_path ({path}).")
+        iu = deps.get("internal_unresolved_specs", [])
+        if not isinstance(iu, list):
+            raise Pass2SemanticError(f"Pass1 contract violation: internal_unresolved_specs must be list ({path}).")
+        for s in iu:
+            if not isinstance(s, str) or not s.strip():
+                raise Pass2SemanticError(f"Pass1 contract violation: internal_unresolved_specs must be strings ({path}).")
 
 
 def _repo_paths_set(repo_index: dict[str, Any]) -> set[str]:
@@ -383,27 +548,20 @@ def _language_by_path_from_repo_index(repo_index: dict[str, Any]) -> dict[str, s
 
 def _signals_from_repo_index(repo_index: dict[str, Any]) -> dict[str, Any]:
     sig = _require_dict(repo_index.get("signals"), name="repo_index.signals")
-    # we keep this as a loose dict, but do not accept wrong types where we depend on them.
     return sig
 
 
 def _read_plan_candidates(repo_index: dict[str, Any]) -> list[str]:
-    """
-    STRICT contract:
-      repo_index["read_plan_suggestions"] is a dict produced by read_plan.suggest_files_to_read
-      and contains:
-        - candidates: list[{"path": str, ...}]
-    """
-    rps = _require_dict(repo_index.get("read_plan_suggestions"), name="repo_index.read_plan_suggestions")
-    cands = _require_list(rps.get("candidates"), name="repo_index.read_plan_suggestions.candidates")
+    rp = _require_dict(repo_index.get("read_plan"), name="repo_index.read_plan")
+    cands = _require_list(rp.get("candidates"), name="repo_index.read_plan.candidates")
 
     out: list[str] = []
     for it in cands:
         if not isinstance(it, dict):
-            raise Pass2SemanticError("Pass1 contract violation: candidates must contain dict entries.")
+            raise Pass2SemanticError("Pass1 contract violation: read_plan.candidates must contain dict entries.")
         p = it.get("path")
         if not isinstance(p, str) or not p.strip():
-            raise Pass2SemanticError("Pass1 contract violation: candidate.path must be a non-empty string.")
+            raise Pass2SemanticError("Pass1 contract violation: read_plan.candidate.path must be a non-empty string.")
         out.append(p.strip())
 
     # deterministic unique preserving order
@@ -417,11 +575,9 @@ def _read_plan_candidates(repo_index: dict[str, Any]) -> list[str]:
 
 
 def _read_plan_closure_seeds(repo_index: dict[str, Any]) -> list[str]:
-    """
-    STRICT contract:
-      repo_index["read_plan_closure_seeds"] is a list[str] emitted by Pass1.
-    """
-    seeds = _require_list_str(repo_index.get("read_plan_closure_seeds"), name="repo_index.read_plan_closure_seeds")
+    rp = _require_dict(repo_index.get("read_plan"), name="repo_index.read_plan")
+    seeds = _require_list_str(rp.get("closure_seeds"), name="repo_index.read_plan.closure_seeds")
+
     seen: set[str] = set()
     out: list[str] = []
     for p in seeds:
@@ -435,23 +591,14 @@ def _extract_pass1_deps(repo_index: dict[str, Any]) -> dict[str, dict[str, Any]]
     """
     STRICT extraction based on Pass1 schema. No compat fallbacks.
 
-    Required per file:
-      - path: str
-      - deps: dict
-        - import_edges: list[dict]
-          Each edge must include:
-            - spec: str
-            - is_external: bool (or coercible)
-            - if is_external == False: resolved_path: str
-
     Output per file:
       {
         "resolved_internal": set[str],
-        "external_specs": set[str],
         "import_edges": list[dict],
         "flags": set[str],
         "language": str|None,
         "top_level_defs": list[str],
+        "internal_unresolved_specs": list[str],
       }
     """
     files = _require_list(repo_index.get("files"), name="repo_index.files")
@@ -465,32 +612,33 @@ def _extract_pass1_deps(repo_index: dict[str, Any]) -> dict[str, dict[str, Any]]
             raise Pass2SemanticError("Pass1 contract violation: each file must have a non-empty 'path'.")
 
         deps = _require_dict(f.get("deps"), name=f"file.deps ({path})")
-        edges_any = deps.get("import_edges")
-        edges_raw = _require_list(edges_any, name=f"file.deps.import_edges ({path})")
+        edges_raw = _require_list(deps.get("import_edges"), name=f"file.deps.import_edges ({path})")
+
         import_edges: list[dict[str, Any]] = []
+        resolved_internal: set[str] = set()
         for e in edges_raw:
             if not isinstance(e, dict):
                 raise Pass2SemanticError(f"Pass1 contract violation: import_edges must contain dict entries ({path}).")
             spec = e.get("spec")
             if not isinstance(spec, str) or not spec.strip():
                 raise Pass2SemanticError(f"Pass1 contract violation: import edge missing spec ({path}).")
-            import_edges.append(dict(e))
-
-        resolved_internal: set[str] = set()
-        external_specs: set[str] = set()
-
-        for e in import_edges:
-            is_external = bool(e.get("is_external", False))
-            spec = str(e.get("spec", "")).strip()
-            if is_external:
-                external_specs.add(spec)
-                continue
+            if bool(e.get("is_external", False)) is not False:
+                raise Pass2SemanticError(f"Pass1 contract violation: import edge is_external must be False ({path}).")
             rp = e.get("resolved_path")
             if not isinstance(rp, str) or not rp.strip():
-                raise Pass2SemanticError(
-                    f"Pass1 contract violation: internal import edge missing resolved_path ({path})."
-                )
+                raise Pass2SemanticError(f"Pass1 contract violation: internal edge missing resolved_path ({path}).")
+            import_edges.append(dict(e))
             resolved_internal.add(rp.strip())
+
+        iu0 = deps.get("internal_unresolved_specs", [])
+        if not isinstance(iu0, list):
+            raise Pass2SemanticError(f"Pass1 contract violation: internal_unresolved_specs must be list ({path}).")
+        internal_unresolved_specs: list[str] = []
+        for s in iu0:
+            if not isinstance(s, str) or not s.strip():
+                raise Pass2SemanticError(f"Pass1 contract violation: internal_unresolved_specs must be strings ({path}).")
+            internal_unresolved_specs.append(s.strip())
+        internal_unresolved_specs = sorted(set(internal_unresolved_specs))
 
         flags_set: set[str] = set()
         fl = f.get("flags")
@@ -519,48 +667,18 @@ def _extract_pass1_deps(repo_index: dict[str, Any]) -> dict[str, dict[str, Any]]
 
         out[path] = {
             "resolved_internal": resolved_internal,
-            "external_specs": external_specs,
             "import_edges": import_edges,
             "flags": flags_set,
             "language": lang_str,
             "top_level_defs": top_defs,
+            "internal_unresolved_specs": internal_unresolved_specs,
         }
 
     return out
 
 
-def _known_present_route_hints(repo_paths: set[str]) -> dict[str, Any]:
-    # keep: this is deterministic and prevents false "missing from snapshot" claims
-    hints: dict[str, Any] = {}
-
-    login_files = []
-    for p in (
-            "frontend/app/login/page.tsx",
-            "frontend/app/login/LoginPageClient.tsx",
-            "frontend/app/login/loginpageclient.tsx",
-    ):
-        if p in repo_paths:
-            login_files.append(p)
-    if login_files:
-        hints["login_route_present"] = True
-        hints["login_route_files"] = login_files
-
-    cs_files = []
-    for p in (
-            "frontend/app/case-studies/page.tsx",
-            "frontend/app/case-studies/layout.tsx",
-    ):
-        if p in repo_paths:
-            cs_files.append(p)
-    if cs_files:
-        hints["case_studies_route_present"] = True
-        hints["case_studies_route_files"] = cs_files
-
-    return hints
-
-
 # -------------------------------------------------------------------
-# Pack selection (deterministic; bounded; driven by pass1 facts)
+# Deterministic pack selection helpers
 # -------------------------------------------------------------------
 
 
@@ -576,6 +694,56 @@ def _truncate_with_tail(text: str, max_chars: int) -> str:
     return text[:head] + "\n/* …TRUNCATED… */\n" + text[-tail:]
 
 
+def _entrypoints_from_signals(repo_index: dict[str, Any], *, available_paths: set[str]) -> list[str]:
+    sig = _signals_from_repo_index(repo_index)
+    eps = sig.get("entrypoints")
+    if eps is None:
+        return []
+    if not isinstance(eps, list):
+        raise Pass2SemanticError("Pass1 contract violation: signals.entrypoints must be a list when present.")
+    out: list[str] = []
+    for it in eps:
+        if not isinstance(it, dict):
+            raise Pass2SemanticError("Pass1 contract violation: signals.entrypoints must contain dict entries.")
+        p = it.get("path")
+        if not isinstance(p, str) or not p.strip():
+            raise Pass2SemanticError("Pass1 contract violation: entrypoint.path must be a non-empty string.")
+        p = p.strip()
+        if p in available_paths:
+            out.append(p)
+    return sorted(set(out))
+
+
+def _candidate_spines_for_known_roots(available_paths: set[str]) -> list[str]:
+    prefixes = ("", "frontend/", "apps/web/", "apps/frontend/")
+    out: list[str] = []
+
+    def add(p: str) -> None:
+        if p in available_paths and p not in out:
+            out.append(p)
+
+    for pref in prefixes:
+        add(f"{pref}middleware.ts")
+        add(f"{pref}middleware.js")
+        add(f"{pref}app/layout.tsx")
+        add(f"{pref}app/layout.ts")
+        add(f"{pref}app/page.tsx")
+        add(f"{pref}app/page.ts")
+        add(f"{pref}next.config.ts")
+        add(f"{pref}next.config.js")
+        add(f"{pref}package.json")
+        add(f"{pref}tsconfig.json")
+        add(f"{pref}jsconfig.json")
+
+    for p in ("pyproject.toml", "uv.lock", "alembic.ini", "package.json", "tsconfig.json", "README.md", "readme.md"):
+        add(p)
+
+    for p in ("backend/main.py", "backend/app.py", "backend/server.py", "backend/security.py", "backend/config.py"):
+        add(p)
+
+    return out
+
+
 def _compute_available_dep_graph(
         *,
         available_paths: set[str],
@@ -585,7 +753,7 @@ def _compute_available_dep_graph(
     in_edges: dict[str, set[str]] = {p: set() for p in available_paths}
 
     for p in available_paths:
-        info = deps_by_file[p]  # STRICT: deps_by_file must cover all pass1 files; available is subset
+        info = deps_by_file[p]
         for dep in info["resolved_internal"]:
             if dep in available_paths:
                 out_edges[p].add(dep)
@@ -633,66 +801,6 @@ def _expand_seeds_by_deps(
     return order
 
 
-def _entrypoints_from_signals(repo_index: dict[str, Any], *, available_paths: set[str]) -> list[str]:
-    sig = _signals_from_repo_index(repo_index)
-    eps = sig.get("entrypoints")
-    if eps is None:
-        return []
-    if not isinstance(eps, list):
-        raise Pass2SemanticError("Pass1 contract violation: signals.entrypoints must be a list when present.")
-    out: list[str] = []
-    for it in eps:
-        if not isinstance(it, dict):
-            raise Pass2SemanticError("Pass1 contract violation: signals.entrypoints must contain dict entries.")
-        p = it.get("path")
-        if not isinstance(p, str) or not p.strip():
-            raise Pass2SemanticError("Pass1 contract violation: entrypoint.path must be a non-empty string.")
-        p = p.strip()
-        if p in available_paths:
-            out.append(p)
-    return sorted(set(out))
-
-
-def _candidate_spines_for_known_roots(available_paths: set[str]) -> list[str]:
-    """
-    Deterministic "spine" file hints across known web roots:
-      - frontend/
-      - apps/web/
-      - apps/frontend/
-      - root-level
-    """
-    prefixes = ("", "frontend/", "apps/web/", "apps/frontend/")
-    out: list[str] = []
-
-    def add(p: str) -> None:
-        if p in available_paths and p not in out:
-            out.append(p)
-
-    # web runtime spines
-    for pref in prefixes:
-        add(f"{pref}middleware.ts")
-        add(f"{pref}middleware.js")
-        add(f"{pref}app/layout.tsx")
-        add(f"{pref}app/layout.ts")
-        add(f"{pref}app/page.tsx")
-        add(f"{pref}app/page.ts")
-        add(f"{pref}next.config.ts")
-        add(f"{pref}next.config.js")
-        add(f"{pref}package.json")
-        add(f"{pref}tsconfig.json")
-        add(f"{pref}jsconfig.json")
-
-    # repo-global spines
-    for p in ("pyproject.toml", "uv.lock", "alembic.ini", "package.json", "tsconfig.json", "README.md", "readme.md"):
-        add(p)
-
-    # backend-ish spines (no prefix expansion; backend tends to be root-level)
-    for p in ("backend/main.py", "backend/app.py", "backend/server.py", "backend/security.py", "backend/config.py"):
-        add(p)
-
-    return out
-
-
 def _select_pack_paths_for_architecture(
         *,
         file_contents_map: dict[str, str],
@@ -705,17 +813,11 @@ def _select_pack_paths_for_architecture(
         raise Pass2SemanticError("pass2: file_contents_map is empty; cannot build LLM evidence pack.")
 
     entrypoints = _entrypoints_from_signals(repo_index, available_paths=available_paths)
-
     closure_seeds = [p for p in _read_plan_closure_seeds(repo_index) if p in available_paths]
     read_plan = [p for p in _read_plan_candidates(repo_index) if p in available_paths]
-
     spines = _candidate_spines_for_known_roots(available_paths)
 
-    # STRICT seed order (deterministic, dedup, fixed rationale):
-    # 1) closure seeds (highest signal)
-    # 2) read plan candidates (rich coverage)
-    # 3) entrypoints (if not already present)
-    # 4) spines (conventions/config/runtime boundary files)
+    # STRICT seed order (deterministic):
     seeds: list[str] = []
     for p in closure_seeds:
         if p not in seeds:
@@ -832,7 +934,7 @@ def _build_arch_files_pack(
         if len(out) >= caps.max_arch_files:
             break
 
-        c = file_contents_map[p]
+        c = file_contents_map.get(p, "")
         if not isinstance(c, str) or not c:
             continue
 
@@ -849,7 +951,7 @@ def _build_arch_files_pack(
         out[p] = c2
         total += len(c2)
 
-    # ensure minimum breadth deterministically (still strict, just “fill”)
+    # ensure minimum breadth deterministically
     floor = min(12, caps.max_arch_files)
     if len(out) < floor:
         for p in ordered_paths:
@@ -857,7 +959,7 @@ def _build_arch_files_pack(
                 break
             if p in out:
                 continue
-            c = file_contents_map[p]
+            c = file_contents_map.get(p, "")
             if not isinstance(c, str) or not c:
                 continue
             remaining = caps.max_arch_input_chars - total
@@ -885,7 +987,6 @@ def _select_supporting_files_for_gaps_and_onboarding(
 
     closure_seeds = [p for p in _read_plan_closure_seeds(repo_index) if p in available]
     read_plan = [p for p in _read_plan_candidates(repo_index) if p in available]
-
     spines = _candidate_spines_for_known_roots(available)
 
     def score(p: str) -> int:
@@ -936,16 +1037,19 @@ def _select_supporting_files_for_gaps_and_onboarding(
 
     out: dict[str, str] = {}
     total = 0
+
     for p in ordered:
         if len(out) >= max_files:
             break
-        c = file_contents_map[p]
+        c = file_contents_map.get(p, "")
         if not isinstance(c, str) or not c:
             continue
         remaining = max_total_chars - total
         if remaining <= 0:
             break
-        c2 = _truncate_with_tail(c, min(max_chars_per_file, remaining))
+        c2 = _truncate_with_tail(c, max_chars_per_file)
+        if len(c2) > remaining:
+            c2 = _truncate_with_tail(c2, remaining)
         if not c2:
             continue
         out[p] = c2
@@ -954,638 +1058,383 @@ def _select_supporting_files_for_gaps_and_onboarding(
     return out
 
 
-def _deps_hints_for_pack(
-        *,
-        pack_paths: list[str],
-        deps_by_file: dict[str, dict[str, Any]],
-        max_internal: int = 10,
-        max_external: int = 8,
-) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for p in pack_paths:
-        info = deps_by_file[p]
-        internal = sorted(info["resolved_internal"])
-        external = sorted(info["external_specs"])
-        flags = sorted(info["flags"])
+# -------------------------------------------------------------------
+# Repo file reading (deterministic, pass1-driven)
+# -------------------------------------------------------------------
 
-        out[p] = {
-            "internal_deps_sample": internal[:max_internal],
-            "external_specs_sample": external[:max_external],
-            "internal_dep_count": len(internal),
-            "external_spec_count": len(external),
-            "flags": flags[:12],
-        }
+
+_BINARY_EXTS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".mp4",
+    ".mov",
+    ".mp3",
+    ".wav",
+    ".ttf",
+    ".otf",
+    ".woff",
+    ".woff2",
+}
+
+
+def _read_repo_file_text(repo_dir: str, rel_path: str, *, max_bytes: int) -> str | None:
+    p = Path(repo_dir) / rel_path
+    if not p.exists() or not p.is_file():
+        return None
+    if p.suffix.lower() in _BINARY_EXTS:
+        return None
+    try:
+        raw = p.read_bytes()
+    except Exception:
+        return None
+    if max_bytes > 0 and len(raw) > max_bytes:
+        raw = raw[:max_bytes]
+    try:
+        return raw.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _build_file_contents_map(repo_dir: str, repo_index: dict[str, Any], job: Job) -> dict[str, str]:
+    """
+    Deterministic:
+    - Only consider pass1_repo_index.files paths (source of truth).
+    - Read text for those files (best-effort), bounded by job.limits.max_file_bytes where available.
+    """
+    max_file_bytes = _job_get(job, "limits.max_file_bytes")
+    try:
+        maxb = int(max_file_bytes) if max_file_bytes is not None else 0
+    except Exception:
+        maxb = 0
+    if maxb <= 0:
+        maxb = 512_000  # safe fallback; pass1 already bounded scanning; pass2 pack caps also bound.
+
+    files = _require_list(repo_index.get("files"), name="repo_index.files")
+    out: dict[str, str] = {}
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        rp = f.get("path")
+        if not isinstance(rp, str) or not rp:
+            continue
+        txt = _read_repo_file_text(repo_dir, rp, max_bytes=maxb)
+        if isinstance(txt, str) and txt:
+            out[rp] = txt
     return out
 
 
 # -------------------------------------------------------------------
-# Prompt payloads (LLM output stays SMALL + grounded)
+# Prompting: strict JSON object output
 # -------------------------------------------------------------------
 
 
-def _build_architecture_payload(
+def _build_system_prompt() -> str:
+    return (
+        "You are Snapshotter Pass2 Semantic.\n"
+        "You must output ONLY a single JSON object (no markdown, no commentary).\n"
+        "The JSON must follow the requested schema strictly.\n"
+        "If you are unsure, use nulls and empty arrays, but keep keys present.\n"
+    )
+
+
+def _build_user_prompt(
         *,
-        repo_url: str,
-        resolved_commit: str,
-        job_id: str,
-        repo_index: dict[str, Any],
-        file_contents_map: dict[str, str],
+        repo_meta: dict[str, Any],
+        caps: SemanticCaps,
+        pass1_repo_index: dict[str, Any],
+        arch_pack: dict[str, str],
+        support_pack: dict[str, str],
         deps_by_file: dict[str, dict[str, Any]],
-        caps: SemanticCaps,
-) -> tuple[dict[str, Any], list[str]]:
-    ordered_paths, selection_debug = _select_pack_paths_for_architecture(
-        file_contents_map=file_contents_map,
-        repo_index=repo_index,
-        deps_by_file=deps_by_file,
-        caps=caps,
-    )
-    arch_files = _build_arch_files_pack(ordered_paths=ordered_paths, file_contents_map=file_contents_map, caps=caps)
-    pack_paths = list(arch_files.keys())
-    files_pack: list[dict[str, Any]] = [{"path": p, "content": c} for p, c in arch_files.items()]
+) -> str:
+    """
+    Keep the prompt deterministic:
+    - stable ordering
+    - explicit schema
+    - include pass1 signals and the two packs
+    """
+    # lightweight structured deps summary to avoid dumping huge edge lists
+    dep_summary: dict[str, Any] = {}
+    for p in sorted(deps_by_file.keys()):
+        info = deps_by_file[p]
+        resolved = sorted([x for x in info["resolved_internal"] if isinstance(x, str)])
+        unresolved = info.get("internal_unresolved_specs", [])
+        dep_summary[p] = {
+            "resolved_internal_count": len(resolved),
+            "resolved_internal_sample": resolved[:12],
+            "internal_unresolved_specs": unresolved[:12] if isinstance(unresolved, list) else [],
+            "flags": sorted(list(info.get("flags", set())))[:12],
+            "language": info.get("language"),
+            "top_level_defs": info.get("top_level_defs", [])[:20],
+        }
 
-    signals = _signals_from_repo_index(repo_index)
-    path_aliases = repo_index.get("path_aliases", {})
-    if not isinstance(path_aliases, dict):
-        raise Pass2SemanticError("Pass1 contract violation: repo_index.path_aliases must be a dict when present.")
-
-    repo_paths = _repo_paths_set(repo_index)
-    presence_hints = _known_present_route_hints(repo_paths)
-
-    deps_hints = _deps_hints_for_pack(pack_paths=pack_paths, deps_by_file=deps_by_file)
-
-    # include a sample of the plan (contracted shapes only)
-    rps = _require_dict(repo_index.get("read_plan_suggestions"), name="repo_index.read_plan_suggestions")
-    rps_sample = _read_plan_candidates(repo_index)[:40]
-    closure_sample = _read_plan_closure_seeds(repo_index)[:80]
-
-    return (
-        {
-            "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit, "job_id": job_id},
-            "rules": {
-                "grounding": (
-                    "Your statements MUST be grounded in the anchor_paths you cite. "
-                    "If unsure, set responsibilities=['unknown'] and add an uncertainty with questions."
-                ),
-                "anchor_paths_constraint": "Every module anchor_paths MUST be a subset of pass2.files[].path.",
-                "no_appendices": (
-                    "Do NOT output dependency lists, file inventories, read plans, or audit appendices. "
-                    "This pass is semantic: boundaries, runtime entrypoints, key flows."
-                ),
-                "missing_claims_rule": (
-                    "You can only claim a feature/file is 'missing from the snapshot' if it is absent from repo_presence_hints. "
-                    "If you did not see a file in pass2.files, say 'not included in provided file contents' instead of 'missing from repo'."
-                ),
-            },
-            "pass1": {
-                "counts": repo_index.get("counts", {}),
-                "path_aliases": path_aliases,
-                "signals": {
-                    "entrypoints": signals.get("entrypoints", []),
-                    "env_vars": signals.get("env_vars", []),
-                    "package_json": signals.get("package_json", {}),
-                },
-                "read_plan": {
-                    "closure_seeds_sample": closure_sample,
-                    "candidates_sample": rps_sample,
-                    "max_files_to_read_default": rps.get("max_files_to_read_default"),
-                },
-                "pack_selection": selection_debug,
-            },
-            "repo_presence_hints": presence_hints,
-            "pass2": {
-                "files": files_pack,
-                "deps_hints_by_file": deps_hints,
-            },
-            "output_contract": {
-                "return_json_object_with_keys": ["modules", "uncertainties"],
-                "modules_require": ["name", "type", "summary", "anchor_paths"],
-                "recommended_module_fields": [
-                    "responsibilities",
-                    "entrypoints",
-                    "public_interfaces",
-                    "data_flows",
-                    "runtime_notes",
-                    "where_to_change",
-                    "risk_notes",
-                ],
-            },
+    schema = {
+        "schema_version": PASS2_SEMANTIC_SCHEMA_VERSION,
+        "generated_at": "ISO8601",
+        "repo": {"repo_url": "string|null", "resolved_commit": "string"},
+        "caps": {
+            "model": "string",
+            "max_output_tokens": "int",
+            "max_arch_files": "int",
+            "max_support_files": "int",
         },
-        pack_paths,
-    )
-
-
-def _architecture_prompt_text(payload: dict[str, Any]) -> str:
-    return (
-            "Generate Pass 2 architecture semantics for this repo snapshot.\n"
-            "Return ONLY a single JSON object (no markdown) with keys:\n"
-            "  - modules: array of module objects\n"
-            "  - uncertainties: array\n\n"
-            "Hard requirements:\n"
-            "1) Each module MUST include anchor_paths (3–10) and they MUST be a subset of pass2.files[].path.\n"
-            "2) summary must be grounded in anchor_paths. If unsure, set responsibilities=['unknown'] and add an uncertainty.\n"
-            "3) Do NOT output dependency lists, read plans, file inventories, or other appendices.\n"
-            "4) Keep output concise and onboarding-useful: define boundaries, runtime entrypoints, and key flows.\n"
-            "5) IMPORTANT: If you did not see a file in pass2.files, do NOT claim it is missing from the repo snapshot.\n"
-            "   Instead say it was not included in the provided file contents.\n\n"
-            "Style guidance:\n"
-            "- Prefer ~6–14 modules total.\n"
-            "- Use module.type from: ['frontend','backend','shared_lib','db','jobs','infra','tooling','docs','unknown'].\n"
-            "- anchor_paths should point to representative files, not every file.\n\n"
-            "INPUT PAYLOAD (JSON):\n"
-            + json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    )
-
-
-def _build_gaps_onboarding_payload(
-        *,
-        repo_url: str,
-        resolved_commit: str,
-        job_id: str,
-        repo_index: dict[str, Any],
-        onboarding_enabled: bool,
-        arch_modules: list[dict[str, Any]],
-        arch_uncertainties: list[dict[str, Any]],
-        deterministic_gap_items: list[dict[str, Any]],
-        file_contents_map: dict[str, str],
-        caps: SemanticCaps,
-) -> dict[str, Any]:
-    support_files = _select_supporting_files_for_gaps_and_onboarding(
-        file_contents_map,
-        repo_index,
-        max_files=caps.max_support_files,
-        max_total_chars=caps.max_support_chars,
-        max_chars_per_file=caps.max_support_chars_per_file,
-    )
-
-    modules_summary: list[dict[str, Any]] = []
-    for m in arch_modules:
-        modules_summary.append(
-            {
-                "name": m.get("name"),
-                "type": m.get("type"),
-                "summary": m.get("summary"),
-                "anchor_paths": m.get("anchor_paths", []),
-                "entrypoints": m.get("entrypoints", []),
-                "where_to_change": m.get("where_to_change", []),
-                "risk_notes": m.get("risk_notes", []),
-            }
-        )
-
-    signals = _signals_from_repo_index(repo_index)
-    path_aliases = repo_index.get("path_aliases", {})
-    if not isinstance(path_aliases, dict):
-        raise Pass2SemanticError("Pass1 contract violation: repo_index.path_aliases must be a dict when present.")
-
-    repo_paths = _repo_paths_set(repo_index)
-    presence_hints = _known_present_route_hints(repo_paths)
-
-    return {
-        "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit, "job_id": job_id},
-        "rules": {
-            "onboarding_enabled": onboarding_enabled,
-            "no_redundant_dumping": "Do NOT restate full code listings. Keep items concise and actionable.",
-            "onboarding_md_goal": (
-                "Write onboarding_md as a practical architect handoff: quickstart, entrypoints, boundaries, "
-                "data/state flow, configuration surface (env vars), and common change locations."
-            ),
-            "missing_claims_rule": (
-                "Do NOT claim routes/pages are missing from the repo snapshot unless repo_presence_hints indicates absent. "
-                "If missing from supporting_files, say it was not included in provided file contents."
-            ),
+        "summary": {
+            "primary_stack": "string|null",
+            "architecture_overview": "string",
+            "key_components": ["string"],
+            "data_flows": ["string"],
+            "auth_and_routing_notes": ["string"],
+            "risks_or_gaps": ["string"],
         },
-        "pass1": {
-            "counts": repo_index.get("counts", {}),
-            "path_aliases": path_aliases,
-            "signals": {
-                "entrypoints": signals.get("entrypoints", []),
-                "env_vars": signals.get("env_vars", []),
-                "package_json": signals.get("package_json", {}),
-            },
-            "read_plan": {
-                "closure_seeds_sample": _read_plan_closure_seeds(repo_index)[:80],
-                "candidates_sample": _read_plan_candidates(repo_index)[:40],
-            },
-        },
-        "repo_presence_hints": presence_hints,
-        "architecture_summary": {"modules": modules_summary, "uncertainties": arch_uncertainties},
-        "deterministic_gaps_already_found": deterministic_gap_items,
-        "supporting_files": [{"path": p, "content": c} for p, c in support_files.items()],
-        "output_contract": {
-            "return_json_object_with_keys": ["gaps", "onboarding_md"],
-            "gaps": {"must_include_keys": ["generated_at", "job_id", "items"]},
-            "onboarding_md": {"type": "string", "allow_empty_if_disabled": True},
+        "evidence": {
+            "arch_pack_paths": ["string"],
+            "support_pack_paths": ["string"],
+            "notable_files": [{"path": "string", "why": "string"}],
         },
     }
 
+    sig = pass1_repo_index.get("signals", {})
+    resolver_inputs = pass1_repo_index.get("resolver_inputs", {})
 
-def _gaps_onboarding_prompt_text(payload: dict[str, Any]) -> str:
-    return (
-            "Generate Pass 2 gaps + onboarding artifacts.\n"
-            "Return ONLY a single JSON object (no markdown) with keys:\n"
-            "  - gaps: object\n"
-            "  - onboarding_md: string\n\n"
-            "Hard requirements:\n"
-            "1) gaps must include keys: generated_at, job_id, items (array).\n"
-            "2) Do NOT duplicate deterministic gaps already listed in deterministic_gaps_already_found.\n"
-            "3) If onboarding_enabled is false, set onboarding_md to an empty string.\n"
-            "4) Keep it concise and self-auditing.\n"
-            "5) IMPORTANT: Do NOT say 'missing from repo snapshot' unless repo_presence_hints indicates absent. "
-            "If you didn't see a file in supporting_files, say it was not included in provided file contents.\n\n"
-            "Onboarding MD requirements (if enabled):\n"
-            "- Must include sections: Overview, Entry points, Configuration (env vars), Common tasks, Where to change code, Risks/footguns.\n"
-            "- Use file paths when referencing code.\n\n"
-            "INPUT PAYLOAD (JSON):\n"
-            + json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    )
+    payload = {
+        "repo_meta": repo_meta,
+        "schema": schema,
+        "pass1_signals": sig,
+        "pass1_resolver_inputs": resolver_inputs,
+        "deps_summary": dep_summary,
+        "arch_pack": {k: arch_pack[k] for k in sorted(arch_pack.keys())},
+        "support_pack": {k: support_pack[k] for k in sorted(support_pack.keys())},
+        "rules": [
+            "Output JSON only.",
+            "Do not invent files or paths; reference only paths present in the packs.",
+            "Keep schema keys present.",
+            "Prefer short, high-signal bullets in arrays.",
+        ],
+    }
 
-
-# -------------------------------------------------------------------
-# Deterministic derivations (deps derived from pass1; no LLM deps)
-# -------------------------------------------------------------------
-
-
-def _derive_deps_from_anchor_paths(
-        modules: list[dict[str, Any]],
-        deps_by_file: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    for m in modules:
-        anchors = m.get("anchor_paths")
-        if not isinstance(anchors, list):
-            anchors = []
-        anchors = [p for p in anchors if isinstance(p, str) and p.strip()]
-
-        internal: set[str] = set()
-        external: set[str] = set()
-        for p in anchors:
-            info = deps_by_file.get(p)
-            if not info:
-                continue
-            internal |= set(info["resolved_internal"])
-            external |= set(info["external_specs"])
-
-        m["anchor_paths"] = anchors
-        m["evidence_paths"] = list(anchors)  # compat name for downstream consumers
-        m["dependencies"] = sorted(internal) + sorted(external)
-
-    return modules
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
 
 
 # -------------------------------------------------------------------
-# Deterministic gap scans (grounded, non-LLM)
+# Artifact writers (atomic; deterministic formatting)
 # -------------------------------------------------------------------
 
 
-def _deterministic_gap_scan(repo_index: dict[str, Any]) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    files = _require_list(repo_index.get("files"), name="repo_index.files")
-    sig = _signals_from_repo_index(repo_index)
+def _write_text(path: str | Path, text: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = (text or "")
+    if payload and not payload.endswith("\n"):
+        payload += "\n"
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(payload, encoding="utf-8", newline="\n")
+    os.replace(tmp, p)
 
-    unresolved_paths: list[str] = []
-    parse_failed: list[str] = []
 
-    for f in files:
-        if not isinstance(f, dict):
-            raise Pass2SemanticError("Pass1 contract violation: repo_index.files must contain dict entries.")
-        p = f.get("path")
-        if not isinstance(p, str) or not p:
-            raise Pass2SemanticError("Pass1 contract violation: each file must have a non-empty 'path'.")
-        flags = f.get("flags")
-        if flags is None:
-            continue
-        if not isinstance(flags, list):
-            raise Pass2SemanticError(f"Pass1 contract violation: flags must be a list when present ({p}).")
-        flags_s = [x for x in flags if isinstance(x, str)]
-        if "import_unresolved" in flags_s:
-            unresolved_paths.append(p)
-        if "python_parse_failed" in flags_s or "js_ts_parse_failed" in flags_s:
-            parse_failed.append(p)
+def _write_json(path: str | Path, obj: dict[str, Any]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(payload, encoding="utf-8", newline="\n")
+    os.replace(tmp, p)
 
-    if unresolved_paths:
-        items.append(
-            {
-                "type": "unresolved_internal_imports",
-                "severity": "medium",
-                "description": "Some files contain internal-looking imports that did not resolve to repo paths in pass1.",
-                "files_involved": sorted(unresolved_paths)[:60],
-                "suggested_questions": [
-                    "Are path aliases/baseUrl configured correctly (tsconfig/jsconfig)?",
-                    "Are imports pointing to generated files or omitted extensions not covered by resolver?",
-                ],
-            }
-        )
 
-    if parse_failed:
-        items.append(
-            {
-                "type": "parser_failures",
-                "severity": "low",
-                "description": "Some files could not be parsed cleanly for defs/imports; pass1 fell back to best-effort.",
-                "files_involved": sorted(parse_failed)[:60],
-                "suggested_questions": ["Are these files syntactically valid? Are they templates or partials?"],
-            }
-        )
+def _stable_json_bytes(obj: Any) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8", errors="replace")
 
-    eps = sig.get("entrypoints")
-    if eps is not None and (not isinstance(eps, list) or len(eps) == 0):
-        items.append(
-            {
-                "type": "no_entrypoints_detected",
-                "severity": "low",
-                "description": "Pass1 did not detect any entrypoint hints (Next.js pages/routes, python __main__, FastAPI app, etc.).",
-                "files_involved": [],
-                "suggested_questions": [
-                    "Is the repo structure non-standard (not frontend/backend)?",
-                    "Do we need additional heuristics for your framework conventions?",
-                ],
-            }
-        )
 
-    return items
+def _fingerprint_pack(pack_obj: dict[str, Any]) -> str:
+    return sha256_bytes(_stable_json_bytes(pack_obj))
 
 
 # -------------------------------------------------------------------
-# Post-enforcement (grounding only; deps derived deterministically later)
-# -------------------------------------------------------------------
-
-
-_ALLOWED_TYPES = {"frontend", "backend", "shared_lib", "db", "jobs", "infra", "tooling", "docs", "unknown"}
-
-
-def _post_enforce_architecture_constraints(
-        *,
-        modules: Any,
-        uncertainties: Any,
-        allowed_paths: set[str],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    out_modules: list[dict[str, Any]] = []
-    out_uncertainties: list[dict[str, Any]] = []
-
-    if isinstance(uncertainties, list):
-        for u in uncertainties:
-            if isinstance(u, dict):
-                out_uncertainties.append(u)
-
-    if not isinstance(modules, list):
-        raise Pass2SemanticError("Pass2 LLM contract violation: 'modules' must be a list.")
-
-    for i, m in enumerate(modules):
-        if not isinstance(m, dict):
-            continue
-        mm = dict(m)
-
-        name = mm.get("name")
-        if not isinstance(name, str) or not name.strip():
-            mm["name"] = f"unknown_module_{i}"
-
-        mtype = mm.get("type")
-        if not isinstance(mtype, str) or not mtype.strip():
-            mm["type"] = "unknown"
-        else:
-            mt = mtype.strip()
-            mm["type"] = mt if mt in _ALLOWED_TYPES else "unknown"
-
-        anchors = mm.get("anchor_paths")
-        if not isinstance(anchors, list):
-            anchors = []
-        anchors = [p for p in anchors if isinstance(p, str) and p in allowed_paths]
-        if len(anchors) > 10:
-            anchors = anchors[:10]
-        mm["anchor_paths"] = anchors
-
-        summary = mm.get("summary")
-        if not isinstance(summary, str) or not summary.strip():
-            resp = mm.get("responsibilities")
-            if isinstance(resp, list):
-                resp2 = [r for r in resp if isinstance(r, str) and r.strip()]
-                if resp2:
-                    summary = "; ".join(resp2[:3])
-            mm["summary"] = summary.strip() if isinstance(summary, str) and summary.strip() else "unknown"
-
-        resp = mm.get("responsibilities")
-        if not isinstance(resp, list):
-            resp = []
-        resp = [r for r in resp if isinstance(r, str) and r.strip()]
-
-        if not anchors:
-            mm["responsibilities"] = ["unknown"]
-            mm["summary"] = "unknown"
-            out_uncertainties.append(
-                {
-                    "type": "ungrounded_module",
-                    "description": (
-                        f"Module '{mm.get('name','unknown')}' lacks anchor_paths in files_read; "
-                        "summary/responsibilities set to unknown."
-                    ),
-                    "files_involved": [],
-                    "suggested_questions": ["Which files define this module? Add representative files to pass2 selection."],
-                }
-            )
-        else:
-            mm["responsibilities"] = resp or ["unknown"]
-            if not resp:
-                out_uncertainties.append(
-                    {
-                        "type": "empty_responsibilities",
-                        "description": f"Module '{mm.get('name','unknown')}' had no responsibilities listed; set to unknown.",
-                        "files_involved": anchors,
-                        "suggested_questions": ["What does this module do? Add explicit responsibilities."],
-                    }
-                )
-
-        # Do NOT accept deps from LLM output (deterministic derivation later)
-        mm["dependencies"] = []
-        mm["evidence_paths"] = list(anchors)  # compat (filled again later)
-
-        out_modules.append(mm)
-
-    return out_modules, out_uncertainties
-
-
-# -------------------------------------------------------------------
-# Gaps normalization / dedupe + false-positive rewrite
-# -------------------------------------------------------------------
-
-
-def _normalize_gaps_object(gaps: Any, *, job_id: str) -> dict[str, Any]:
-    if not isinstance(gaps, dict):
-        raise Pass2SemanticError("Pass2 LLM contract violation: 'gaps' must be an object.")
-    out = dict(gaps)
-    out.setdefault("generated_at", None)
-    out["job_id"] = job_id
-    items = out.get("items")
-    if not isinstance(items, list):
-        raise Pass2SemanticError("Pass2 LLM contract violation: gaps.items must be a list.")
-    cleaned: list[dict[str, Any]] = []
-    for it in items:
-        if isinstance(it, dict):
-            cleaned.append(it)
-    out["items"] = cleaned
-    return out
-
-
-def _dedupe_gap_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    out: list[dict[str, Any]] = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        key = json.dumps(
-            {
-                "type": it.get("type"),
-                "severity": it.get("severity"),
-                "module": it.get("module"),
-                "dependency": it.get("dependency"),
-                "description": it.get("description"),
-                "evidence_paths": it.get("evidence_paths"),
-                "files_involved": it.get("files_involved"),
-            },
-            sort_keys=True,
-            ensure_ascii=False,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(it)
-    return out
-
-
-def _fix_false_missing_route_gap_items(items: list[dict[str, Any]], allowed_paths: set[str]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        t = it.get("type")
-        files_involved = it.get("files_involved")
-        present: list[str] = []
-        if isinstance(files_involved, list):
-            present = [p for p in files_involved if isinstance(p, str) and p in allowed_paths]
-
-        if t == "missing_route" and present:
-            it2 = dict(it)
-            it2["type"] = "route_implementation_check"
-            it2["severity"] = it2.get("severity") or "medium"
-            it2["description"] = (
-                    (it2.get("description") or "").strip()
-                    + " (Referenced route file(s) exist in snapshot; verify if implementation is placeholder or not wired.)"
-            ).strip()
-            out.append(it2)
-        else:
-            out.append(it)
-    return out
-
-
-# -------------------------------------------------------------------
-# Public API
+# Public entrypoint
 # -------------------------------------------------------------------
 
 
 def generate_pass2_semantic_artifacts(
         *,
-        repo_url: str,
-        resolved_commit: str,
-        job_id: str,
-        repo_index: dict[str, Any],
-        files_read: list[dict[str, Any]],
-        files_not_read: list[dict[str, Any]],
-        file_contents_map: dict[str, str],
-) -> tuple[dict[str, Any], dict[str, Any], str]:
+        repo_dir: str,
+        job: Job,
+        out_dir: str | Path,
+        pass1_repo_index: dict[str, Any],
+        repo_url: str | None = None,  # <-- compat with caller; optional override
+) -> dict[str, Any]:
     """
-    Contracted behavior:
-      - Pass2 LLM outputs ONLY: semantic modules + anchor_paths + short semantics
-      - evidence_paths and dependencies are derived deterministically from pass1 after the fact
-      - bounded read pack is selected deterministically from pass1 facts (closure seeds + read plan + deps expansion),
-        constrained to provided file_contents_map (no hidden reads)
+    Pass 2 "proper contract" entrypoint.
+
+    Writes:
+      - PASS2_ARCH_PACK.json
+      - PASS2_SUPPORT_PACK.json
+      - PASS2_SEMANTIC.json
+      - PASS2_LLM_RAW.txt (always)
+      - PASS2_LLM_REPAIRED.txt (only if repair happened)
+
+    Strict:
+    - assumes pass1 contract (validated)
+    - no back-compat schema paths
+
+    Note:
+    - `repo_url` is accepted for compatibility with callers that still pass it.
+      If provided, it overrides job.repo_url.
     """
-    caps = _semantic_caps_from_env()
+    _assert_pass1_repo_index_contract(pass1_repo_index)
 
-    # STRICT: validate contract essentials early
-    _ = _read_plan_closure_seeds(repo_index)
-    _ = _read_plan_candidates(repo_index)
+    out_root = Path(out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    deps_by_file = _extract_pass1_deps(repo_index)
+    caps = _caps_from_job_or_env(job)
 
-    # -------------------------
-    # Architecture semantics
-    # -------------------------
-    arch_payload, pack_paths = _build_architecture_payload(
-        repo_url=repo_url,
-        resolved_commit=resolved_commit,
-        job_id=job_id,
-        repo_index=repo_index,
+    # Repo URL resolution (deterministic precedence):
+    # 1) explicit kwarg from caller (compat)
+    # 2) job.repo_url (if present)
+    if isinstance(repo_url, str):
+        repo_url = repo_url.strip() or None
+    if repo_url is None:
+        try:
+            repo_url = getattr(job, "repo_url", None)
+        except Exception:
+            repo_url = None
+        if isinstance(repo_url, str):
+            repo_url = repo_url.strip() or None
+
+    resolved_commit = _require_dict(pass1_repo_index.get("job"), name="repo_index.job").get("resolved_commit")
+    assert isinstance(resolved_commit, str) and resolved_commit.strip()
+
+    deps_by_file = _extract_pass1_deps(pass1_repo_index)
+    file_contents_map = _build_file_contents_map(repo_dir, pass1_repo_index, job)
+
+    ordered_paths, selection_debug = _select_pack_paths_for_architecture(
         file_contents_map=file_contents_map,
+        repo_index=pass1_repo_index,
         deps_by_file=deps_by_file,
         caps=caps,
     )
-    arch_prompt = _architecture_prompt_text(arch_payload)
 
-    arch_obj = _openai_call_json(
-        prompt=arch_prompt,
-        model=caps.model,
-        max_output_tokens=caps.max_output_tokens,
-        system="You are a precise code architect. Output JSON only.",
-    )
-
-    allowed_paths = set(file_contents_map.keys())
-    repo_paths = _repo_paths_set(repo_index)
-
-    enforced_modules, enforced_uncertainties = _post_enforce_architecture_constraints(
-        modules=arch_obj.get("modules"),
-        uncertainties=arch_obj.get("uncertainties", []),
-        allowed_paths=allowed_paths,
-    )
-
-    # deterministically attach deps (and evidence_paths := anchor_paths for compat)
-    enforced_modules = _derive_deps_from_anchor_paths(enforced_modules, deps_by_file)
-
-    arch_out: dict[str, Any] = {"modules": enforced_modules, "uncertainties": enforced_uncertainties}
-
-    # -------------------------
-    # Deterministic gaps (non-LLM)
-    # -------------------------
-    deterministic_gap_items = _deterministic_gap_scan(repo_index)
-
-    # -------------------------
-    # LLM gaps + onboarding (bounded supporting pack)
-    # -------------------------
-    gaps_payload = _build_gaps_onboarding_payload(
-        repo_url=repo_url,
-        resolved_commit=resolved_commit,
-        job_id=job_id,
-        repo_index=repo_index,
-        onboarding_enabled=caps.onboarding_enabled,
-        arch_modules=enforced_modules,
-        arch_uncertainties=enforced_uncertainties,
-        deterministic_gap_items=deterministic_gap_items,
+    arch_files = _build_arch_files_pack(
+        ordered_paths=ordered_paths,
         file_contents_map=file_contents_map,
         caps=caps,
     )
-    gaps_prompt = _gaps_onboarding_prompt_text(gaps_payload)
 
-    gaps_obj = _openai_call_json(
-        prompt=gaps_prompt,
-        model=caps.model,
-        max_output_tokens=caps.max_output_tokens,
-        system="You are a precise repo auditor. Output JSON only.",
+    support_files = _select_supporting_files_for_gaps_and_onboarding(
+        file_contents_map,
+        pass1_repo_index,
+        max_files=caps.max_support_files,
+        max_total_chars=caps.max_support_chars,
+        max_chars_per_file=caps.max_support_chars_per_file,
     )
 
-    gaps_raw = _normalize_gaps_object(gaps_obj.get("gaps"), job_id=job_id)
-    onboarding_md = gaps_obj.get("onboarding_md")
-    if onboarding_md is None:
-        onboarding_md = ""
-    if not isinstance(onboarding_md, str):
-        raise Pass2SemanticError("Pass2 LLM contract violation: onboarding_md must be a string.")
-    if not caps.onboarding_enabled:
-        onboarding_md = ""
+    arch_pack_obj = {
+        "schema_version": PASS2_ARCH_PACK_SCHEMA_VERSION,
+        "generated_at": utc_ts(),
+        "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit},
+        "caps": {
+            "max_arch_files": caps.max_arch_files,
+            "max_arch_input_chars": caps.max_arch_input_chars,
+            "max_arch_chars_per_file": caps.max_arch_chars_per_file,
+            "pack_dep_hops": caps.pack_dep_hops,
+            "pack_max_dep_edges_per_file": caps.pack_max_dep_edges_per_file,
+        },
+        "selection_debug": selection_debug,
+        "files": {k: arch_files[k] for k in sorted(arch_files.keys())},
+    }
+    arch_pack_obj["fingerprint_sha256"] = _fingerprint_pack(
+        {"repo": arch_pack_obj["repo"], "caps": arch_pack_obj["caps"], "files": arch_pack_obj["files"]}
+    )
 
-    merged_items = list(deterministic_gap_items)
-    for it in gaps_raw["items"]:
-        if isinstance(it, dict):
-            merged_items.append(it)
+    support_pack_obj = {
+        "schema_version": PASS2_SUPPORT_PACK_SCHEMA_VERSION,
+        "generated_at": utc_ts(),
+        "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit},
+        "caps": {
+            "max_support_files": caps.max_support_files,
+            "max_support_chars": caps.max_support_chars,
+            "max_support_chars_per_file": caps.max_support_chars_per_file,
+        },
+        "files": {k: support_files[k] for k in sorted(support_files.keys())},
+    }
+    support_pack_obj["fingerprint_sha256"] = _fingerprint_pack(
+        {"repo": support_pack_obj["repo"], "caps": support_pack_obj["caps"], "files": support_pack_obj["files"]}
+    )
 
-    # keep: correctness over “missing” language if file was present in pack
-    merged_items = _fix_false_missing_route_gap_items(merged_items, allowed_paths)
+    _write_json(out_root / PASS2_ARCH_PACK_FILENAME, arch_pack_obj)
+    _write_json(out_root / PASS2_SUPPORT_PACK_FILENAME, support_pack_obj)
 
-    gaps_out = dict(gaps_raw)
-    gaps_out["items"] = _dedupe_gap_items(merged_items)
+    # LLM call
+    system = _build_system_prompt()
+    user_prompt = _build_user_prompt(
+        repo_meta={"repo_url": repo_url, "resolved_commit": resolved_commit},
+        caps=caps,
+        pass1_repo_index=pass1_repo_index,
+        arch_pack=arch_pack_obj["files"],
+        support_pack=support_pack_obj["files"],
+        deps_by_file=deps_by_file,
+    )
 
-    return arch_out, gaps_out, onboarding_md
+    obj, raw_text, repaired_text = _openai_call_json(
+        prompt=user_prompt,
+        model=caps.model,
+        max_output_tokens=caps.max_output_tokens,
+        system=system,
+    )
+
+    _write_text(out_root / PASS2_LLM_RAW_FILENAME, raw_text)
+    if repaired_text is not None:
+        _write_text(out_root / PASS2_LLM_REPAIRED_FILENAME, repaired_text)
+
+    pass2_semantic = {
+        "schema_version": PASS2_SEMANTIC_SCHEMA_VERSION,
+        "generated_at": utc_ts(),
+        "repo": {"repo_url": repo_url, "resolved_commit": resolved_commit},
+        "caps": {
+            "onboarding_enabled": caps.onboarding_enabled,
+            "model": caps.model,
+            "max_output_tokens": caps.max_output_tokens,
+            "max_arch_input_chars": caps.max_arch_input_chars,
+            "max_arch_files": caps.max_arch_files,
+            "max_arch_chars_per_file": caps.max_arch_chars_per_file,
+            "max_support_files": caps.max_support_files,
+            "max_support_chars": caps.max_support_chars,
+            "max_support_chars_per_file": caps.max_support_chars_per_file,
+            "pack_dep_hops": caps.pack_dep_hops,
+            "pack_max_dep_edges_per_file": caps.pack_max_dep_edges_per_file,
+        },
+        "inputs": {
+            "pass1_repo_index_schema_version": pass1_repo_index.get("schema_version"),
+            "pass1_repo_index_fingerprint_sha256": sha256_bytes(_stable_json_bytes(pass1_repo_index)),
+            "arch_pack_fingerprint_sha256": arch_pack_obj.get("fingerprint_sha256"),
+            "support_pack_fingerprint_sha256": support_pack_obj.get("fingerprint_sha256"),
+        },
+        "llm_output": obj,
+        "llm_raw_paths": {
+            "raw_text": PASS2_LLM_RAW_FILENAME,
+            "repaired_text": PASS2_LLM_REPAIRED_FILENAME if repaired_text is not None else None,
+        },
+    }
+
+    fp_obj = {
+        "repo": pass2_semantic["repo"],
+        "caps": pass2_semantic["caps"],
+        "inputs": pass2_semantic["inputs"],
+        "llm_output": pass2_semantic["llm_output"],
+    }
+    pass2_semantic["fingerprint_sha256"] = sha256_bytes(_stable_json_bytes(fp_obj))
+
+    _write_json(out_root / PASS2_SEMANTIC_FILENAME, pass2_semantic)
+
+    return {
+        "pass2_semantic_path": str(out_root / PASS2_SEMANTIC_FILENAME),
+        "pass2_arch_pack_path": str(out_root / PASS2_ARCH_PACK_FILENAME),
+        "pass2_support_pack_path": str(out_root / PASS2_SUPPORT_PACK_FILENAME),
+        "pass2_semantic": pass2_semantic,
+    }

@@ -7,7 +7,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from snapshotter.job import Job
 
@@ -21,7 +21,7 @@ except Exception:  # pragma: no cover
     tomllib = None  # type: ignore
 
 # --------------------------------------------------------------------------------------
-# Pass 1 Contract (Locked, strict)
+# Pass 1 Contract (LOCKED, strict)
 #
 # Pass 1 MUST produce two first-class artifacts derived deterministically from the repo:
 #   1) PASS1_REPO_INDEX.json   (scan facts + indexes + read plan block)
@@ -31,6 +31,21 @@ except Exception:  # pragma: no cover
 # - No back-compat schema paths.
 # - No "try a few locations" for config caps.
 # - No fallback heuristics that guess internal vs external beyond explicit rules.
+#
+# Language scope (LOCKED):
+# - Pass1 parses imports ONLY for: python, typescript, javascript.
+# - Non-supported languages are still included in files[] but import parsing is not performed.
+#
+# Architecture scope (LOCKED):
+# - Snapshotter models ONLY repo-internal dependency structure for closure + read plan.
+# - External dependency inventory / security dependency analysis is OUT OF SCOPE.
+#
+# ReadPlan compatibility requirement (LOCKED):
+# - Every included file MUST carry deps.import_edges as a deterministic list (may be empty).
+# - deps.import_edges MUST contain ONLY resolved internal edges:
+#       {kind, spec, lineno, resolved_path, is_external=False}
+# - Internal unresolved imports are recorded ONLY under deps.internal_unresolved_specs
+#   and MUST NOT appear as edges.
 # --------------------------------------------------------------------------------------
 
 PASS1_REPO_INDEX_FILENAME = "PASS1_REPO_INDEX.json"
@@ -52,11 +67,7 @@ LANG_BY_EXT = {
     ".yml": "yaml",
 }
 
-# Python-only fallback import regex (kept for non-python text formats)
-PY_IMPORT_RE = re.compile(
-    r"^\s*(?:from\s+([a-zA-Z0-9_\.]+)\s+import|import\s+([a-zA-Z0-9_\.]+))",
-    re.M,
-)
+SUPPORTED_IMPORT_LANGS = {"python", "typescript", "javascript"}
 
 # --------------------------------------------------------------------------------------
 # JS/TS import extraction (regex + comment stripping; deterministic)
@@ -137,7 +148,7 @@ CONFIG_CANDIDATES = (
 )
 
 # -----------------------------
-# Environment variable extraction
+# Environment variable extraction (kept as general repo signal, NOT security inventory)
 # -----------------------------
 PY_ENV_PATTERNS = [
     re.compile(r"""\bos\.getenv\(\s*["']([A-Z0-9_]+)["']"""),
@@ -151,7 +162,7 @@ JS_ENV_PATTERNS = [
 ]
 
 # -----------------------------
-# Cheap routing/auth signals (repo-level)
+# Routing/auth hints (kept only for closure seeding, NOT security analysis)
 # -----------------------------
 NEXT_MW_MATCHER_RE = re.compile(r"""(?ms)\bmatcher\s*:\s*(\[[^\]]*\])""")
 NEXT_PROTECTED_LIST_RE = re.compile(
@@ -189,7 +200,10 @@ def _lineno_from_index(text: str, idx: int) -> int:
 # Python parsing
 # --------------------------------------------------------------------------------------
 def parse_python_defs_and_imports(text: str) -> tuple[list[str], list[str]]:
-    """Backward-compatible: defs + unique import module tokens (no evidence)."""
+    """
+    Best-effort defs + unique import module tokens.
+    Used ONLY as a fallback for top_defs + imports_raw when AST edge extraction fails.
+    """
     defs: list[str] = []
     imports: list[str] = []
     try:
@@ -217,42 +231,25 @@ def parse_python_import_edges(text: str) -> tuple[list[str], list[dict[str, Any]
     """
     defs: list[str] = []
     edges: list[dict[str, Any]] = []
-    try:
-        tree = ast.parse(text)
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                defs.append(node.name)
-            elif isinstance(node, ast.Import):
-                for n in node.names:
-                    spec = n.name
-                    if spec:
-                        edges.append(
-                            {"kind": "import", "spec": spec, "lineno": int(getattr(node, "lineno", 1) or 1)}
-                        )
-            elif isinstance(node, ast.ImportFrom):
-                level = int(getattr(node, "level", 0) or 0)
-                mod = getattr(node, "module", None)
-                spec = ("." * level) + (mod or "")
-                spec = spec if spec else ("." * level) if level else ""
+    tree = ast.parse(text)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defs.append(node.name)
+        elif isinstance(node, ast.Import):
+            for n in node.names:
+                spec = n.name
                 if spec:
-                    edges.append(
-                        {"kind": "from_import", "spec": spec, "lineno": int(getattr(node, "lineno", 1) or 1)}
-                    )
-    except Exception:
-        pass
+                    edges.append({"kind": "import", "spec": spec, "lineno": int(getattr(node, "lineno", 1) or 1)})
+        elif isinstance(node, ast.ImportFrom):
+            level = int(getattr(node, "level", 0) or 0)
+            mod = getattr(node, "module", None)
+            spec = ("." * level) + (mod or "")
+            spec = spec if spec else ("." * level) if level else ""
+            if spec:
+                edges.append({"kind": "from_import", "spec": spec, "lineno": int(getattr(node, "lineno", 1) or 1)})
 
     edges.sort(key=lambda e: (int(e.get("lineno", 1)), str(e.get("kind", "")), str(e.get("spec", ""))))
     return sorted(set(defs)), edges
-
-
-def parse_best_effort_pythonish_imports(text: str) -> list[str]:
-    """Fallback for non-Python, non-JS files (e.g., shell-ish snippets in docs)."""
-    found = set()
-    for m in PY_IMPORT_RE.finditer(text):
-        mod = m.group(1) or m.group(2)
-        if mod:
-            found.add(mod)
-    return sorted(found)
 
 
 # --------------------------------------------------------------------------------------
@@ -261,7 +258,7 @@ def parse_best_effort_pythonish_imports(text: str) -> list[str]:
 def strip_js_ts_comments(text: str) -> str:
     """
     Remove // and /* */ comments while preserving newlines and string contents.
-    Important: preserve newlines so match.start() -> lineno remains stable.
+    Preserve newlines so match.start() -> lineno remains stable.
     """
     out: list[str] = []
     i = 0
@@ -559,8 +556,6 @@ def _collect_workspace_packages(repo_dir: str) -> dict[str, Any]:
     Deterministically build a map:
       - package name -> package root rel dir (dir containing its package.json)
     from root package.json workspaces ONLY.
-
-    No fallback roots. We control repos + pipeline.
     """
     repo_root = Path(repo_dir)
     roots_scanned: list[str] = []
@@ -804,12 +799,11 @@ def _resolve_js_ts_import_to_repo_path(
     """
     Resolver that returns a small, evidence-friendly record.
 
-    Contract changes:
-    - No common Next alias fallback ("@/... -> frontend/...") unless it exists in tsconfig paths.
-    - No heuristic classifier: internal vs external is determined by:
-      (a) resolved_path exists => internal_resolved
-      (b) unresolved and looks internal (relative/rooted/alias/workspace) => internal_unresolved
-      (c) otherwise => external
+    Architecture-only contract:
+    - We attempt to resolve only to repo paths.
+    - We classify unresolved as internal_unresolved only when the spec is "repo-shaped"
+      (relative/rooted/alias/workspace/baseUrl). Otherwise we treat it as external and
+      it will be dropped from architecture edges.
     """
     s = (spec or "").strip()
     if not s:
@@ -959,7 +953,9 @@ def _resolve_js_ts_import_to_repo_path(
                     if not isinstance(t, str) or not t:
                         continue
                     base = t.rstrip("/")
-                    module_noext = _normalize_rel_path(os.path.normpath(f"{base}/{tail}" if tail else base).replace("\\", "/"))
+                    module_noext = _normalize_rel_path(
+                        os.path.normpath(f"{base}/{tail}" if tail else base).replace("\\", "/")
+                    )
 
                     if Path(s).suffix:
                         candidates_tried += 1
@@ -1058,7 +1054,7 @@ def _resolve_js_ts_import_to_repo_path(
             "classification_reason": "baseUrl",
         }
 
-    # otherwise: external (bare or scoped)
+    # Otherwise: external (architecture-out-of-scope)
     return {
         "resolved_path": None,
         "resolution_kind": None,
@@ -1085,7 +1081,7 @@ def _candidate_paths_for_py_module(module_path: str) -> list[str]:
 def _discover_python_roots(repo_dir: str) -> dict[str, Any]:
     """
     Deterministically discover python import roots.
-    Keep it simple + real-config-driven:
+    Keep it config-driven:
       - "" (repo root) always
       - "src" if present
       - pyproject.toml hints (poetry packages[].from, setuptools package-dir)
@@ -1171,6 +1167,7 @@ def _resolve_python_import_to_repo_path(
                     return _normalize_rel_path(cand)
         return None
 
+    # relative: leading dots
     m = re.match(r"^(\.+)(.*)$", s)
     if m:
         dots = m.group(1) or ""
@@ -1201,6 +1198,7 @@ def _resolve_python_import_to_repo_path(
             "classification_reason": "relative",
         }
 
+    # absolute: try roots; unresolved absolute is treated as external (architecture-out-of-scope)
     module_path = s.replace(".", "/")
     resolved = _try_py_candidates(module_path)
     return {
@@ -1292,6 +1290,7 @@ def _package_json_signals(text: str) -> dict[str, Any] | None:
     for dep_key in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
         v = obj.get(dep_key)
         if isinstance(v, dict):
+            # note: this is not used for dependency inventory; it is a lightweight repo signal.
             sig[dep_key] = sorted([str(x) for x in v.keys()])
 
     return sig or None
@@ -1376,31 +1375,23 @@ def _tags_for_read_plan_path(p: str) -> list[str]:
 
 def _normalize_read_plan_candidates(obj: Any) -> list[dict[str, Any]]:
     """
-    Canonical read plan suggestions:
-      candidates: list[{"path": str, "why": str|None, "tags": [str]|None, ...}]
-
-    Snapshotter is controlled: we accept only list/dict forms produced by suggest_files_to_read.
+    Strict contract: suggest_files_to_read returns a dict with a "candidates" list of dicts.
+    Anything else is a contract violation.
     """
+    if not isinstance(obj, dict):
+        raise RuntimeError("pass1: read_plan suggestions must be a dict")
+    c = obj.get("candidates")
+    if not isinstance(c, list):
+        raise RuntimeError("pass1: read_plan suggestions missing candidates list")
     out: list[dict[str, Any]] = []
-    if isinstance(obj, dict):
-        c = obj.get("candidates")
-        if isinstance(c, list):
-            for it in c:
-                if isinstance(it, dict) and isinstance(it.get("path"), str) and it["path"].strip():
-                    out.append(dict(it))
-                elif isinstance(it, str) and it.strip():
-                    out.append({"path": it.strip()})
-            return out
-
-    if isinstance(obj, list):
-        for it in obj:
-            if isinstance(it, str) and it.strip():
-                out.append({"path": it.strip()})
-            elif isinstance(it, dict) and isinstance(it.get("path"), str) and it["path"].strip():
-                out.append(dict(it))
-        return out
-
-    return []
+    for it in c:
+        if not isinstance(it, dict):
+            raise RuntimeError("pass1: read_plan candidate must be dict")
+        p = it.get("path")
+        if not isinstance(p, str) or not p.strip():
+            raise RuntimeError("pass1: read_plan candidate missing/invalid path")
+        out.append(dict(it))
+    return out
 
 
 def _read_plan_max_files(job: Job) -> int:
@@ -1532,13 +1523,14 @@ def build_repo_index(repo_dir: str, job: Job, *, resolved_commit: str) -> dict[s
             sha = sha256_bytes(raw)
             language = infer_language(rel_path)
 
+            # Architecture-only:
+            # - deps.import_edges contains ONLY resolved internal edges
+            # - deps.internal_unresolved_specs captures unresolved internal-only specs
             imports_raw: list[str] = []
-            imports_resolved_internal: list[str] = []
-            imports_external: list[str] = []
+            internal_resolved_paths: list[str] = []
             internal_unresolved_specs_sorted: list[str] = []
-            ambiguous_specs_sorted: list[str] = []
 
-            import_edges: list[dict[str, Any]] = []
+            import_edges_internal_resolved: list[dict[str, Any]] = []
             top_defs: list[str] = []
             flags: list[str] = []
 
@@ -1548,6 +1540,7 @@ def build_repo_index(repo_dir: str, job: Job, *, resolved_commit: str) -> dict[s
                 record_skip(rel_path, "text_decode_failed", size)
                 continue
 
+            # general repo signals
             resource_edges = _extract_env_var_edges(text, language=language)
             for e in resource_edges:
                 key = str(e.get("key", "")).strip()
@@ -1580,72 +1573,75 @@ def build_repo_index(repo_dir: str, job: Job, *, resolved_commit: str) -> dict[s
             for occ in _maybe_extract_auth_signals(rel_path, language, text):
                 _auth_occ_set.add(json.dumps(occ, sort_keys=True, separators=(",", ":")))
 
+            # -------------------------
+            # Import parsing: supported langs only
+            # -------------------------
             if language == "python":
                 try:
-                    top_defs, import_edges = parse_python_import_edges(text)
-                    imports_raw = sorted({str(e.get("spec")) for e in import_edges if e.get("spec")})
+                    top_defs, import_edges_raw = parse_python_import_edges(text)
+                    imports_raw = sorted({str(e.get("spec")) for e in import_edges_raw if e.get("spec")})
                 except Exception:
                     flags.append("python_parse_failed")
                     top_defs, imports_raw = parse_python_defs_and_imports(text)
-                    import_edges = []
+                    import_edges_raw = []
 
                 internal_set: set[str] = set()
-                external_set: set[str] = set()
                 internal_unresolved_specs: set[str] = set()
 
-                for e in import_edges:
+                for e in import_edges_raw:
+                    if not isinstance(e, dict):
+                        continue
                     spec = str(e.get("spec", "")).strip()
                     if not spec:
                         continue
+
                     res = _resolve_python_import_to_repo_path(
                         spec=spec,
                         from_file_repo_path=rel_path,
                         repo_dir=repo_dir,
                         python_roots=python_roots,
                     )
-                    e["resolved_path"] = res.get("resolved_path")
-                    e["resolution_kind"] = res.get("resolution_kind")
-                    e["resolution_candidates_tried_count"] = int(res.get("resolution_candidates_tried_count", 0) or 0)
-                    e["resolution_attempted"] = bool(res.get("resolution_attempted", False))
-                    e["classification"] = str(res.get("classification", "external"))
-                    e["classification_reason"] = str(res.get("classification_reason", "unknown"))
 
-                    if e["resolved_path"]:
-                        e["is_external"] = False
-                        internal_set.add(str(e["resolved_path"]))
+                    resolved_path = res.get("resolved_path")
+                    if isinstance(resolved_path, str) and resolved_path:
+                        internal_set.add(resolved_path)
+                        import_edges_internal_resolved.append(
+                            {
+                                "kind": str(e.get("kind", "")),
+                                "spec": spec,
+                                "lineno": int(e.get("lineno", 1) or 1),
+                                "resolved_path": resolved_path,
+                                "is_external": False,
+                            }
+                        )
                     else:
-                        # python: treat "dot" or resolver-internal_unresolved as internal_unresolved, else external
-                        if spec.startswith(".") or str(e.get("classification")) == "internal_unresolved":
-                            e["is_external"] = False
+                        # Record unresolved ONLY as a spec (no edge emission).
+                        # Keep only relative/"repo-shaped" unresolved.
+                        if spec.startswith(".") or str(res.get("classification")) == "internal_unresolved":
                             internal_unresolved_specs.add(spec)
                             flags.append("import_unresolved")
-                        else:
-                            e["is_external"] = True
-                            external_set.add(spec)
 
-                imports_resolved_internal = sorted(internal_set)
-                imports_external = sorted(external_set)
+                internal_resolved_paths = sorted(internal_set)
                 internal_unresolved_specs_sorted = sorted(internal_unresolved_specs)
-                ambiguous_specs_sorted = []
 
             elif language in ("typescript", "javascript"):
                 try:
-                    top_defs, import_edges = parse_js_ts_import_edges(text)
+                    top_defs, import_edges_raw = parse_js_ts_import_edges(text)
                     if not top_defs:
                         flags.append("top_level_defs_best_effort_empty")
-                    imports_raw = sorted({str(e.get("spec")) for e in import_edges if e.get("spec")})
+                    imports_raw = sorted({str(e.get("spec")) for e in import_edges_raw if e.get("spec")})
                 except Exception:
                     flags.append("js_ts_parse_failed")
-                    imports_raw = []
-                    import_edges = []
                     top_defs = []
+                    imports_raw = []
+                    import_edges_raw = []
 
                 internal_set: set[str] = set()
-                external_set: set[str] = set()
                 internal_unresolved_specs: set[str] = set()
-                ambiguous_specs: set[str] = set()
 
-                for e in import_edges:
+                for e in import_edges_raw:
+                    if not isinstance(e, dict):
+                        continue
                     spec = str(e.get("spec", "")).strip()
                     if not spec:
                         continue
@@ -1658,44 +1654,48 @@ def build_repo_index(repo_dir: str, job: Job, *, resolved_commit: str) -> dict[s
                         workspace_packages=workspace_packages_map,
                     )
 
-                    e["resolved_path"] = res.get("resolved_path")
-                    e["resolution_kind"] = res.get("resolution_kind")
-                    e["resolution_candidates_tried_count"] = int(res.get("resolution_candidates_tried_count", 0) or 0)
-                    e["resolution_attempted"] = bool(res.get("resolution_attempted", False))
-                    e["classification"] = str(res.get("classification", "external"))
-                    e["classification_reason"] = str(res.get("classification_reason", "unknown"))
-                    if "workspace_package" in res:
-                        e["workspace_package"] = res.get("workspace_package")
+                    classification = str(res.get("classification", "external"))
+                    resolved_path = res.get("resolved_path")
 
-                    if e["resolved_path"]:
-                        e["is_external"] = False
-                        internal_set.add(str(e["resolved_path"]))
+                    if isinstance(resolved_path, str) and resolved_path:
+                        internal_set.add(resolved_path)
+                        import_edges_internal_resolved.append(
+                            {
+                                "kind": str(e.get("kind", "")),
+                                "spec": spec,
+                                "lineno": int(e.get("lineno", 1) or 1),
+                                "resolved_path": resolved_path,
+                                "is_external": False,
+                            }
+                        )
                     else:
-                        # Internal-unresolved if it was an internal-ish addressing mode we attempted.
-                        # Otherwise external.
-                        if str(e.get("classification")) == "internal_unresolved":
-                            e["is_external"] = False
+                        # Record unresolved ONLY as a spec (no edge emission).
+                        if classification == "internal_unresolved":
                             internal_unresolved_specs.add(spec)
                             flags.append("import_unresolved")
-                        else:
-                            e["is_external"] = True
-                            external_set.add(spec)
-                            if spec.startswith("@") and "/" in spec:
-                                ambiguous_specs.add(spec)
 
-                imports_resolved_internal = sorted(internal_set)
-                imports_external = sorted(external_set)
+                internal_resolved_paths = sorted(internal_set)
                 internal_unresolved_specs_sorted = sorted(internal_unresolved_specs)
-                ambiguous_specs_sorted = sorted(ambiguous_specs)
 
             else:
-                imports_raw = parse_best_effort_pythonish_imports(text)
-                flags.append("top_level_defs_unknown")
-                import_edges = [{"kind": "best_effort_import", "spec": s, "lineno": 1} for s in imports_raw]
-                imports_resolved_internal = []
-                imports_external = sorted(set(imports_raw))
+                # Non-supported: no parsing performed.
+                flags.append("language_no_import_parse")
+                top_defs = []
+                imports_raw = []
+                internal_resolved_paths = []
                 internal_unresolved_specs_sorted = []
-                ambiguous_specs_sorted = []
+                import_edges_internal_resolved = []
+
+            # Canonical evidence list for ReadPlan: resolved internal edges only (may be empty).
+            import_edges_sorted = sorted(
+                import_edges_internal_resolved,
+                key=lambda e: (
+                    int(e.get("lineno", 1) or 1),
+                    str(e.get("kind", "")),
+                    str(e.get("spec", "")),
+                    str(e.get("resolved_path") or ""),
+                ),
+            )
 
             if rel_path.endswith("package.json") and language == "json":
                 sig = _package_json_signals(text)
@@ -1705,42 +1705,14 @@ def build_repo_index(repo_dir: str, job: Job, *, resolved_commit: str) -> dict[s
             total_bytes += size
             files_included += 1
 
-            import_edges_sorted = sorted(
-                import_edges,
-                key=lambda e: (
-                    int(e.get("lineno", 1) or 1),
-                    str(e.get("kind", "")),
-                    str(e.get("spec", "")),
-                    str(e.get("resolved_path") or ""),
-                    str(e.get("classification") or ""),
-                    str(e.get("is_external", "")),
-                ),
-            )
-
             deps_block = {
                 "import_edges": import_edges_sorted,
-                "internal_resolved_paths": imports_resolved_internal,
+                "internal_resolved_paths": internal_resolved_paths,
                 "internal_unresolved_specs": internal_unresolved_specs_sorted,
-                "external_specs": imports_external,
-                "ambiguous_specs": ambiguous_specs_sorted,
-                # backward compat mirror (kept)
-                "internal": imports_resolved_internal,
-                "external": imports_external,
+                # Kept for schema stability; out of scope so always empty.
+                "external_specs": [],
+                "ambiguous_specs": [],
             }
-
-            export_edges = [
-                {
-                    "kind": str(e.get("kind", "")),
-                    "spec": str(e.get("spec", "")),
-                    "lineno": int(e.get("lineno", 1) or 1),
-                    "resolved_path": e.get("resolved_path"),
-                    "is_external": bool(e.get("is_external", False)),
-                }
-                for e in import_edges_sorted
-                if str(e.get("kind", "")) == "export_from"
-            ]
-            if export_edges:
-                deps_block["export_edges"] = export_edges
 
             files.append(
                 {
@@ -1748,12 +1720,12 @@ def build_repo_index(repo_dir: str, job: Job, *, resolved_commit: str) -> dict[s
                     "bytes": size,
                     "sha256": sha,
                     "language": language,
-                    "imports": imports_raw,  # backward compat
                     "imports_raw": imports_raw,
-                    "imports_resolved_internal": imports_resolved_internal,
-                    "imports_external": imports_external,
+                    "imports_resolved_internal": internal_resolved_paths,
+                    "imports_external": [],  # out of scope
                     "top_level_defs": top_defs,
                     "flags": flags,
+                    # ReadPlan expects either deps.import_edges or import_edges; we provide both.
                     "import_edges": import_edges_sorted,
                     "deps": deps_block,
                     "resource_edges": resource_edges,
@@ -1782,14 +1754,13 @@ def build_repo_index(repo_dir: str, job: Job, *, resolved_commit: str) -> dict[s
 
         internal_resolved = deps.get("internal_resolved_paths") or []
         internal_unresolved = deps.get("internal_unresolved_specs") or []
-        external_specs = deps.get("external_specs") or []
-        ambiguous_specs = deps.get("ambiguous_specs") or []
 
         import_index_by_path[p] = {
             "internal_resolved_paths": sorted([x for x in internal_resolved if isinstance(x, str) and x]),
             "internal_unresolved_specs": sorted([x for x in internal_unresolved if isinstance(x, str) and x]),
-            "external_specs": sorted([x for x in external_specs if isinstance(x, str) and x]),
-            "ambiguous_specs": sorted([x for x in ambiguous_specs if isinstance(x, str) and x]),
+            # schema-stable, but out of scope:
+            "external_specs": [],
+            "ambiguous_specs": [],
         }
 
         edges = deps.get("import_edges") or []
@@ -1938,7 +1909,6 @@ def build_repo_index(repo_dir: str, job: Job, *, resolved_commit: str) -> dict[s
     # Contract job block
     # ------------------------------------------------------------------
     job_block = job.model_dump()
-    # enforce: resolved_commit must be present and correct
     job_block["resolved_commit"] = resolved_commit
 
     # ------------------------------------------------------------------
@@ -1969,7 +1939,7 @@ def build_repo_index(repo_dir: str, job: Job, *, resolved_commit: str) -> dict[s
         "filters": job.model_dump().get("filters", {}),
         "resolver_inputs": resolver_inputs,
         "signals": repo_signals,
-        "import_index": {"by_path": import_index_by_path, "reverse_internal": reverse_internal_out},
+        "import_index": repo_import_index,
         "files": files,
         "skipped_files": skipped,
         "read_plan": {
@@ -2010,6 +1980,8 @@ def build_dependency_graph(pass1_repo_index: dict[str, Any]) -> dict[str, Any]:
     forward_internal: dict[str, list[str]] = {}
     reverse_internal: dict[str, list[str]] = {}
     unresolved_internal_specs: dict[str, list[str]] = {}
+
+    # schema-stable but out-of-scope:
     external_specs: dict[str, list[str]] = {}
 
     for src in sorted(by_path.keys()):
@@ -2021,17 +1993,13 @@ def build_dependency_graph(pass1_repo_index: dict[str, Any]) -> dict[str, Any]:
 
         ir = v.get("internal_resolved_paths", [])
         iu = v.get("internal_unresolved_specs", [])
-        ex = v.get("external_specs", [])
 
         ir_list = sorted([x for x in ir if isinstance(x, str) and x])
         iu_list = sorted([x for x in iu if isinstance(x, str) and x])
-        ex_list = sorted([x for x in ex if isinstance(x, str) and x])
 
         forward_internal[src] = ir_list
         if iu_list:
             unresolved_internal_specs[src] = iu_list
-        if ex_list:
-            external_specs[src] = ex_list
 
         for dst in ir_list:
             reverse_internal.setdefault(dst, [])
@@ -2054,6 +2022,7 @@ def build_dependency_graph(pass1_repo_index: dict[str, Any]) -> dict[str, Any]:
         "forward_internal": forward_internal,
         "reverse_internal": reverse_internal,
         "unresolved_internal_specs": unresolved_internal_specs,
+        # schema-stable, out of scope:
         "external_specs": external_specs,
         "counts": counts,
     }
@@ -2062,6 +2031,7 @@ def build_dependency_graph(pass1_repo_index: dict[str, Any]) -> dict[str, Any]:
         "repo": out["repo"],
         "forward_internal": out["forward_internal"],
         "unresolved_internal_specs": out["unresolved_internal_specs"],
+        # keep in fingerprint for stability of key presence; it will be empty
         "external_specs": out["external_specs"],
     }
     out["fingerprint_sha256"] = sha256_bytes(_stable_json_bytes(fp_obj))

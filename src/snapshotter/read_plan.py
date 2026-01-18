@@ -1,50 +1,47 @@
-# snapshotter/read_plan.py
+# src/snapshotter/read_plan.py
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 # --------------------------------------------------------------------------------------
 # Deterministic Read Plan (Pass1-only inputs) — STRICT CONTRACT (LOCKED)
 #
-# This module is deterministic and assumes Pass1 provides the evidence it needs.
-# We DO NOT "guess" imports via legacy heuristics anymore.
+# Snapshotter architecture scope:
+# - ReadPlan ranks files to read to understand repo architecture (entrypoints + internals).
+# - External dependency inventory / security analysis is OUT OF SCOPE.
 #
 # REQUIRED Pass1 file-shape invariants for this module:
 #   - files: list[dict] where each file has:
 #       * path: str
 #       * deps.import_edges: list[dict]  (preferred)
-#         OR import_edges: list[dict]    (acceptable, but still evidence-based)
+#         OR import_edges: list[dict]    (acceptable)
 #
-# REQUIRED edge-shape invariants:
-#   - spec: str (may be external)
-#   - For internal edges: resolved_path: str and is_external == False
+# Edge handling rules (LOCKED):
+#   - ReadPlan ONLY uses "internal resolved" edges for graph signals:
+#       * internal_resolved edge := dict with resolved_path: str (non-empty)
+#   - All other edges (sentinel, external, unresolved) are ignored for scoring.
+#   - We DO NOT require spec to be non-empty (sentinel may have spec="").
+#   - We DO NOT require is_external to exist (Pass1 may include it; ReadPlan doesn't need it).
 #
 # Output contract:
 #   - suggest_files_to_read(...) returns {"max_files_to_read_default": int, "candidates": [...]}
 #   - "candidates" is a list of dicts: {"path": str, "score": float, "reasons": [str...]}
-#   - No v2 list. Downstream closure seeding must operate on read_plan_suggestions["candidates"].
+#   - No v2 list; downstream closure seeding must use read_plan["candidates"].
 # --------------------------------------------------------------------------------------
 
-# Known "app roots" we want to treat as equivalent for scoring/bucketing.
-# Keep this bounded and deterministic (no globbing).
+# Known "app roots" treated as equivalent for scoring/bucketing.
 _KNOWN_PREFIXES: tuple[str, ...] = (
     "frontend/",
     "apps/web/",
     "apps/frontend/",
 )
 
-# Regex that matches any of the prefixes above, optional.
 _PREFIX_RX = r"(?:frontend/|apps/web/|apps/frontend/)"
 
 
 def _strip_known_prefix(path: str) -> tuple[str, str]:
-    """
-    Returns (prefix, stripped) where stripped has the known prefix removed.
-    Deterministic; first-match wins based on _KNOWN_PREFIXES ordering.
-    """
     p = (path or "").replace("\\", "/")
     for pref in _KNOWN_PREFIXES:
         if p.startswith(pref):
@@ -52,7 +49,7 @@ def _strip_known_prefix(path: str) -> tuple[str, str]:
     return "", p
 
 
-# --- Pattern-based priorities (Next.js + backend/security) ---
+# --- Pattern-based priorities (frontend/back-end entrypoints + configs; NOT security inventory) ---
 
 HIGH_PATTERNS: list[tuple[re.Pattern[str], int, str]] = [
     # Next.js app router key files
@@ -78,12 +75,9 @@ HIGH_PATTERNS: list[tuple[re.Pattern[str], int, str]] = [
     (re.compile(r"(^|/)migrations?/"), 60, "migrations"),
     (re.compile(r"(^|/)alembic/"), 60, "alembic"),
     (re.compile(r"(^|/)schema\.prisma$"), 70, "prisma_schema"),
-    # Contracts / clients / SDK
+    # Contracts / clients / SDK (architecture, not security)
     (re.compile(r"(^|/)(contracts|client|clients|sdk|openapi|swagger)/"), 70, "contract_or_sdk"),
     (re.compile(r"(^|/)(types|interfaces|dto|validators)/"), 55, "types_dto_validators"),
-    # Auth / security
-    (re.compile(r"(^|/)(auth|security|permissions|rbac)/"), 70, "auth_security_dir"),
-    (re.compile(r"(^|/).*(jwt|token|session|oauth|csrf|cors).*\."), 50, "auth_security_keyword"),
 ]
 
 NEG_PATTERNS: list[tuple[re.Pattern[str], int, str]] = [
@@ -124,9 +118,6 @@ class Candidate:
 
 
 def _bucket(path: str) -> str:
-    """
-    Bucketing honors known monorepo prefixes by stripping them first.
-    """
     _, stripped = _strip_known_prefix(path)
     for k in ("app/", "pages/", "src/", "lib/", "backend/", "api/", "server/"):
         if stripped.startswith(k):
@@ -136,10 +127,11 @@ def _bucket(path: str) -> str:
 
 def _edges_for_file(f: dict[str, Any]) -> list[dict[str, Any]]:
     """
-    STRICT: only evidence-bearing edges are accepted.
+    STRICT: ReadPlan accepts only evidence-bearing containers from Pass1.
     Looks for:
       - f["deps"]["import_edges"] (preferred)
       - f["import_edges"] (acceptable)
+    Container may include sentinel/unresolved edges; ReadPlan will ignore them for scoring.
     """
     deps = f.get("deps")
     if isinstance(deps, dict):
@@ -149,66 +141,66 @@ def _edges_for_file(f: dict[str, Any]) -> list[dict[str, Any]]:
     edges2 = f.get("import_edges")
     if isinstance(edges2, list):
         return [e for e in edges2 if isinstance(e, dict)]
-    return []
+    raise RuntimeError("read_plan: file missing deps.import_edges or import_edges (Pass1 contract violation)")
 
 
-def _compute_imported_by(files: list[dict[str, Any]]) -> dict[str, int]:
+def _internal_resolved_edges(edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    STRICT fan-in:
-      imported_by_count[path] = number of internal edges (is_external==False) whose resolved_path == path
-    Requires Pass1 evidence edges.
+    Internal edge := resolved_path is a non-empty string.
+    Everything else (sentinel/external/unresolved) is ignored.
     """
+    out: list[dict[str, Any]] = []
+    for e in edges:
+        rp = e.get("resolved_path")
+        if isinstance(rp, str) and rp:
+            out.append(e)
+    return out
+
+
+def _assert_files_shape(files: list[dict[str, Any]]) -> list[str]:
     if not isinstance(files, list) or not files:
         raise RuntimeError("read_plan: files must be a non-empty list")
 
     included_paths: list[str] = []
     for f in files:
+        if not isinstance(f, dict):
+            raise RuntimeError("read_plan: files must contain dict entries only")
         p = f.get("path")
-        if isinstance(p, str) and p:
-            included_paths.append(p)
-    if not included_paths:
-        raise RuntimeError("read_plan: files list contains no valid 'path' strings")
+        if not isinstance(p, str) or not p:
+            raise RuntimeError("read_plan: every file must include non-empty 'path' string")
+        included_paths.append(p)
 
+        # Require edges container to exist; may contain sentinel/unresolved.
+        _ = _edges_for_file(f)
+
+    return included_paths
+
+
+def _compute_imported_by(files: list[dict[str, Any]], included_paths: list[str]) -> dict[str, int]:
+    """
+    STRICT fan-in (architecture-only):
+      imported_by_count[path] = number of internal-resolved edges whose resolved_path == path
+    """
     included_set = set(included_paths)
     imported_by: dict[str, int] = {p: 0 for p in included_paths}
 
-    saw_any_edges = False
-
     for f in files:
         edges = _edges_for_file(f)
-        if not edges:
-            continue
-
-        saw_any_edges = True
-        for e in edges:
-            # Count only internal edges with a resolved_path.
-            if bool(e.get("is_external", False)):
-                continue
+        for e in _internal_resolved_edges(edges):
             rp = e.get("resolved_path")
-            if not isinstance(rp, str) or not rp:
-                # Internal edge without resolved_path breaks determinism & usefulness.
-                raise RuntimeError("read_plan: internal import edge missing resolved_path")
-            if rp in included_set:
+            if isinstance(rp, str) and rp in included_set:
                 imported_by[rp] = imported_by.get(rp, 0) + 1
-
-    if not saw_any_edges:
-        raise RuntimeError(
-            "read_plan: no import_edges found on any file; Pass1 must provide deps.import_edges evidence"
-        )
 
     return imported_by
 
 
 def _imports_count_for_file(f: dict[str, Any]) -> int:
     """
-    STRICT fan-out:
-      imports_count = number of edges with a non-empty 'spec'
-    Requires Pass1 evidence edges (same source as _compute_imported_by).
+    STRICT fan-out (architecture-only):
+      imports_count = number of internal-resolved edges (resolved_path present)
     """
     edges = _edges_for_file(f)
-    if not edges:
-        raise RuntimeError("read_plan: missing import_edges on file (Pass1 contract violation)")
-    return len([e for e in edges if isinstance(e.get("spec"), str) and e.get("spec")])
+    return len(_internal_resolved_edges(edges))
 
 
 def _score(path: str, imports_count: int, imported_by_count: int) -> tuple[float, list[str]]:
@@ -217,17 +209,20 @@ def _score(path: str, imports_count: int, imported_by_count: int) -> tuple[float
 
     for rx, w, r in HIGH_PATTERNS:
         if rx.search(path):
-            score += w
+            score += float(w)
             reasons.append(r)
 
     for rx, w, r in NEG_PATTERNS:
         if rx.search(path):
-            score -= w
+            score -= float(w)
             reasons.append(f"deprioritized:{r}")
 
-    # graph-ish signals (deterministic)
+    # graph-ish signals (deterministic, architecture-only)
     score += 2.0 * float(imports_count)
     score += 10.0 * float(imported_by_count)
+
+    if imports_count == 0 and imported_by_count == 0:
+        reasons.append("graph_isolated_or_no_internal_edges")
 
     return score, reasons
 
@@ -249,9 +244,10 @@ def suggest_files_to_read(
         ]
       }
     """
-    caps = caps or dict(DEFAULT_CAPS)
+    caps = dict(caps) if caps is not None else dict(DEFAULT_CAPS)
 
-    imported_by = _compute_imported_by(files)
+    included_paths = _assert_files_shape(files)
+    imported_by = _compute_imported_by(files, included_paths)
 
     cands: list[Candidate] = []
     for f in files:
@@ -269,7 +265,12 @@ def suggest_files_to_read(
     must_include_rx = [re.compile(p) for p in DEFAULT_MUST_INCLUDE]
     picked: list[Candidate] = []
     picked_set: set[str] = set()
+
+    # Ensure bucket_counts covers all buckets we may produce.
     bucket_counts: dict[str, int] = {k: 0 for k in caps.keys()}
+    if "other" not in bucket_counts:
+        bucket_counts["other"] = 0
+        caps.setdefault("other", 9999)
 
     def try_pick(c: Candidate) -> None:
         b = _bucket(c.path)
@@ -288,14 +289,14 @@ def suggest_files_to_read(
 
     # fill remainder under caps
     for c in cands:
-        if len(picked) >= max_files:
+        if len(picked) >= int(max_files):
             break
         try_pick(c)
 
     return {
-        "max_files_to_read_default": max_files,
+        "max_files_to_read_default": int(max_files),
         "candidates": [
-            {"path": c.path, "score": round(c.score, 3), "reasons": c.reasons[:8]}
+            {"path": c.path, "score": round(float(c.score), 3), "reasons": c.reasons[:8]}
             for c in picked
         ],
     }

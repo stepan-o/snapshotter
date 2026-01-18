@@ -78,8 +78,8 @@ class SnapshotterState(TypedDict, total=False):
 
     # pass2 fetch reporting
     pass2_total_chars: int
-    pass2_files_read: list[dict[str, Any]]  # [{path, chars, truncated}]
-    pass2_not_read_reasons: dict[str, str]  # {path: reason}
+    pass2_files_read: list[dict[str, Any]]
+    pass2_not_read_reasons: dict[str, str]
 
     # pass2 planning debug (optional)
     pass2_read_plan_debug: dict[str, Any]
@@ -87,6 +87,47 @@ class SnapshotterState(TypedDict, total=False):
     # upload/output
     s3_paths: dict[str, Optional[str]]
     result: dict[str, Any]
+
+
+# -----------------------------
+# Artifact Path Registry - SINGLE SOURCE OF TRUTH
+# -----------------------------
+def build_local_paths(out_dir: str) -> dict[str, str]:
+    """Centralized definition of all artifact file paths."""
+    out_dir_path = Path(out_dir)
+    return {
+        # Pass1 artifacts (canonical)
+        "pass1_repo_index": str(out_dir_path / "PASS1_REPO_INDEX.json"),
+        "dependency_graph": str(out_dir_path / "DEPENDENCY_GRAPH.json"),
+
+        # Convenience alias (non-canonical)
+        "repo_index": str(out_dir_path / "repo_index.json"),
+
+        # Pass2 semantic artifacts
+        "pass2_semantic": str(out_dir_path / "PASS2_SEMANTIC.json"),
+        "pass2_arch_pack": str(out_dir_path / "PASS2_ARCH_PACK.json"),
+        "pass2_support_pack": str(out_dir_path / "PASS2_SUPPORT_PACK.json"),
+        "pass2_llm_raw_output": str(out_dir_path / "PASS2_LLM_RAW_OUTPUT.txt"),
+        "pass2_llm_repaired_output": str(out_dir_path / "PASS2_LLM_REPAIRED_OUTPUT.txt"),
+
+        # Derived artifacts
+        "architecture_snapshot": str(out_dir_path / "ARCHITECTURE_SUMMARY_SNAPSHOT.json"),
+        "gaps": str(out_dir_path / "GAPS_AND_INCONSISTENCIES.json"),
+        "onboarding": str(out_dir_path / "ONBOARDING.md"),
+        "artifact_manifest": str(out_dir_path / "artifact_manifest.json"),
+    }
+
+
+def get_validation_paths(local_paths: dict[str, str]) -> dict[str, str]:
+    """Extract paths required for validation."""
+    return {
+        "repo_index": local_paths["repo_index"],
+        "artifact_manifest": local_paths["artifact_manifest"],
+        "architecture_snapshot": local_paths["architecture_snapshot"],
+        "gaps": local_paths["gaps"],
+        "onboarding": local_paths["onboarding"],
+        "pass2_semantic": local_paths["pass2_semantic"],
+    }
 
 
 # -----------------------------
@@ -123,11 +164,25 @@ def _require_file(path: Path, *, label: str) -> None:
         raise RuntimeError(f"required artifact missing: {label} ({path})")
 
 
-def build_artifact_manifest(local_paths: dict[str, Optional[str]]) -> dict[str, Any]:
+def build_artifact_manifest(local_paths: dict[str, str]) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     stable_fingerprints: dict[str, str] = {}
 
-    for name, p in local_paths.items():
+    # Artifacts to include in manifest (excluding debug/raw files)
+    manifest_artifacts = [
+        "pass1_repo_index",
+        "dependency_graph",
+        "repo_index",
+        "architecture_snapshot",
+        "gaps",
+        "onboarding",
+        "pass2_semantic",
+        "pass2_arch_pack",
+        "pass2_support_pack",
+    ]
+
+    for name in manifest_artifacts:
+        p = local_paths.get(name)
         if not p:
             continue
         path = Path(p)
@@ -178,16 +233,10 @@ def _repo_index_included_paths(repo_index: dict[str, Any]) -> list[str]:
 def _pass2_defaults_from_env() -> dict[str, int]:
     """
     Pass 2 fetch caps.
-
-    Notes:
-    - We accept both *_CHARS and legacy-ish *_CHAR variants to avoid config typos breaking runs.
-    - max_chars_per_file is optional; 0/absent disables per-file truncation.
     """
     max_files = int(os.environ.get("SNAPSHOTTER_PASS2_MAX_FILES", "120"))
 
     max_total_chars_raw = os.environ.get("SNAPSHOTTER_PASS2_MAX_TOTAL_CHARS", "").strip()
-    if not max_total_chars_raw:
-        max_total_chars_raw = os.environ.get("SNAPSHOTTER_PASS2_MAX_TOTAL_CHAR", "").strip()
     max_total_chars = int(max_total_chars_raw) if max_total_chars_raw else 250000
 
     max_chars_per_file_raw = os.environ.get("SNAPSHOTTER_PASS2_MAX_CHARS_PER_FILE", "").strip()
@@ -199,74 +248,73 @@ def _pass2_defaults_from_env() -> dict[str, int]:
     return caps
 
 
+def _require_read_plan_obj(repo_index: dict[str, Any]) -> dict[str, Any]:
+    """
+    LOCKED CONTRACT:
+      - Pass1 MUST emit repo_index["read_plan"] as an object (dict).
+    """
+    rp = repo_index.get("read_plan")
+    if not isinstance(rp, dict):
+        raise RuntimeError("PASS1_REPO_INDEX.read_plan must be an object (dict)")
+    return rp
+
+
 def _extract_candidate_paths(repo_index: dict[str, Any]) -> list[str]:
     """
-    Extract Pass 1 read-plan suggestions.
-
-    Canonical shape:
-      {"candidates":[{"path":"..."}, ...]}
-
-    We keep list/dict tolerance because it costs nothing and doesn't introduce split-brain.
-    Returns: candidate paths in original order (may include duplicates).
+    Extract Pass1 read plan candidates.
     """
-    v = repo_index.get("read_plan_suggestions")
+    rp = _require_read_plan_obj(repo_index)
+    v = rp.get("candidates")
+
+    if not isinstance(v, list) or not v:
+        raise RuntimeError("PASS1_REPO_INDEX.read_plan.candidates must be a non-empty list")
+
     out: list[str] = []
-
-    if isinstance(v, dict):
-        cands = v.get("candidates", []) or []
-        if isinstance(cands, list):
-            for c in cands:
-                if isinstance(c, str) and c:
-                    out.append(c)
-                elif isinstance(c, dict):
-                    p = c.get("path")
-                    if isinstance(p, str) and p:
-                        out.append(p)
-        return out
-
-    if isinstance(v, list):
-        for it in v:
-            if isinstance(it, str) and it:
-                out.append(it)
-            elif isinstance(it, dict):
-                p = it.get("path")
-                if isinstance(p, str) and p:
-                    out.append(p)
-        return out
+    for it in v:
+        if isinstance(it, str) and it:
+            out.append(it)
+            continue
+        if isinstance(it, dict):
+            p = it.get("path")
+            if isinstance(p, str) and p:
+                out.append(p)
+                continue
+        raise RuntimeError("PASS1_REPO_INDEX.read_plan.candidates contains invalid entry")
 
     return out
 
 
 def _extract_closure_seed_paths(repo_index: dict[str, Any]) -> list[str]:
     """
-    Pass1 emits read_plan_closure_seeds. We treat it as deterministic priority.
+    Extract Pass1 read plan closure seeds.
     """
-    v = repo_index.get("read_plan_closure_seeds")
-    out: list[str] = []
+    rp = _require_read_plan_obj(repo_index)
+    v = rp.get("closure_seeds")
 
-    if isinstance(v, list):
-        for it in v:
-            if isinstance(it, str) and it:
-                out.append(it)
-            elif isinstance(it, dict):
-                p = it.get("path")
-                if isinstance(p, str) and p:
-                    out.append(p)
+    if v is None:
+        return []
+
+    if not isinstance(v, list):
+        raise RuntimeError("PASS1_REPO_INDEX.read_plan.closure_seeds must be a list when present")
+
+    out: list[str] = []
+    for it in v:
+        if isinstance(it, str) and it:
+            out.append(it)
+            continue
+        if isinstance(it, dict):
+            p = it.get("path")
+            if isinstance(p, str) and p:
+                out.append(p)
+                continue
+        raise RuntimeError("PASS1_REPO_INDEX.read_plan.closure_seeds contains invalid entry")
 
     return out
 
 
 def _deterministic_read_plan(repo_index: dict[str, Any], *, max_files: int) -> tuple[list[str], dict[str, Any]]:
     """
-    Deterministic plan selection (LOCKED):
-      1) read_plan_closure_seeds (order preserved)
-      2) read_plan_suggestions.candidates (order preserved)
-      3) top-off with remaining included paths (lexicographic)
-
-    Then:
-      - de-dupe while preserving order
-      - gate to included paths
-      - cap at max_files
+    Deterministic plan selection.
     """
     seed_paths = _extract_closure_seed_paths(repo_index)
     cand_paths = _extract_candidate_paths(repo_index)
@@ -311,7 +359,7 @@ def _deterministic_read_plan(repo_index: dict[str, Any], *, max_files: int) -> t
 
 def _llm_read_plan_stub(repo_index: dict[str, Any], *, max_files: int) -> tuple[list[str], list[str], dict[str, Any]]:
     """
-    v0.1 uses deterministic plan selection; semantic generation is in pass2_semantic.py.
+    v0.1 uses deterministic plan selection.
     """
     plan, debug = _deterministic_read_plan(repo_index, max_files=max_files)
     return plan, [], debug
@@ -320,7 +368,6 @@ def _llm_read_plan_stub(repo_index: dict[str, Any], *, max_files: int) -> tuple[
 def _stream_read_utf8_with_replacement(path: Path, *, max_chars: int) -> tuple[str, bool]:
     """
     Stream read file as UTF-8 with replacement, up to max_chars characters.
-    Returns (text, hit_limit) where hit_limit means we read >= max_chars chars.
     """
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     chunks: list[str] = []
@@ -361,10 +408,7 @@ def _compute_files_not_read(
         not_read_reasons_for_selected: dict[str, str],
 ) -> list[dict[str, Any]]:
     """
-    Build files_not_read across *all included* paths, with explicit reasons:
-    - if file is read => omitted
-    - if selected but not read => use recorded reason or "unknown_not_read"
-    - if included but not selected => "not_in_read_plan"
+    Build files_not_read across *all included* paths.
     """
     included_paths = _repo_index_included_paths(repo_index)
 
@@ -407,8 +451,7 @@ def _normalize_architecture_snapshot(
         files_not_read: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """
-    Force self-auditing + required top-level keys, regardless of LLM drift.
-    Also ensures each module has evidence_paths and responsibilities (unknown if missing).
+    Force self-auditing + required top-level keys.
     """
     out = dict(arch or {})
     out["generated_at"] = utc_ts()
@@ -469,6 +512,7 @@ def _normalize_architecture_snapshot(
         if not isinstance(resp, list) or not resp:
             resp = []
         resp = [r for r in resp if isinstance(r, str) and r.strip()]
+
         if not ev:
             m["responsibilities"] = ["unknown"]
             uncertainties.append(
@@ -516,34 +560,8 @@ def node_load_job(state: SnapshotterState) -> SnapshotterState:
         Path(workdir).mkdir(parents=True, exist_ok=True)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-        # Canonical filenames come from pass1 when available.
-        # We still keep repo_index.json as a *convenience alias* for existing tooling,
-        # but PASS1_REPO_INDEX.json is the source of truth.
-        try:
-            from snapshotter.pass1 import PASS1_REPO_INDEX_FILENAME  # type: ignore
-        except Exception:
-            PASS1_REPO_INDEX_FILENAME = "PASS1_REPO_INDEX.json"  # type: ignore
-
-        try:
-            from snapshotter.pass1 import DEPENDENCY_GRAPH_FILENAME  # type: ignore
-        except Exception:
-            DEPENDENCY_GRAPH_FILENAME = "DEPENDENCY_GRAPH.json"  # type: ignore
-
-        local_paths = {
-            # Canonical Pass1 artifacts (required by contract)
-            "pass1_repo_index": str(Path(out_dir) / str(PASS1_REPO_INDEX_FILENAME)),
-            "dependency_graph": str(Path(out_dir) / str(DEPENDENCY_GRAPH_FILENAME)),
-            # Convenience alias (non-canonical)
-            "repo_index": str(Path(out_dir) / "repo_index.json"),
-            # Pass2 + misc
-            "artifact_manifest": str(Path(out_dir) / "artifact_manifest.json"),
-            "architecture_snapshot": str(Path(out_dir) / "ARCHITECTURE_SUMMARY_SNAPSHOT.json"),
-            "gaps": str(Path(out_dir) / "GAPS_AND_INCONSISTENCIES.json"),
-            "onboarding": str(Path(out_dir) / "ONBOARDING.md"),
-            # Debug-only LLM raw/repaired (not uploaded by default)
-            "pass2_llm_raw_output": str(Path(out_dir) / "PASS2_LLM_RAW_OUTPUT.txt"),
-            "pass2_llm_repaired_output": str(Path(out_dir) / "PASS2_LLM_REPAIRED_OUTPUT.txt"),
-        }
+        # Build ALL artifact paths in one place
+        local_paths = build_local_paths(out_dir)
 
         state["stage"] = stage
         state["job"] = job
@@ -574,10 +592,6 @@ def node_pass1_build_index(state: SnapshotterState) -> SnapshotterState:
       - Pass1 stage MUST produce BOTH:
           * PASS1_REPO_INDEX.json (canonical)
           * DEPENDENCY_GRAPH.json (canonical)
-      - graph.py MUST call pass1.generate_pass1_artifacts(...) to do so.
-      - graph.py MUST fail fast if either artifact is missing/empty.
-      - resolved_commit correctness is enforced (branch/ref runs).
-      - repo_index.json is written as a convenience alias only (non-canonical).
     """
     stage = STAGE_PASS1_REPO_INDEX
     try:
@@ -588,13 +602,10 @@ def node_pass1_build_index(state: SnapshotterState) -> SnapshotterState:
 
         resolved_commit = state.get("resolved_commit", "unknown")
 
-        try:
-            from snapshotter.pass1 import generate_pass1_artifacts  # type: ignore
-        except Exception as e:
-            raise RuntimeError("pass1.generate_pass1_artifacts is required by the locked contract") from e
+        from snapshotter.pass1 import generate_pass1_artifacts
 
         # Run Pass1 (canonical artifact writer).
-        generate_pass1_artifacts(  # type: ignore[misc]
+        generate_pass1_artifacts(
             repo_dir=state["repo_dir"],
             job=job,
             out_dir=str(out_dir),
@@ -769,39 +780,66 @@ def node_pass2_generate_outputs(state: SnapshotterState) -> SnapshotterState:
             not_read_reasons_for_selected=not_read_reasons,
         )
 
-        try:
-            arch_raw, gaps_raw, onboarding_md = generate_pass2_semantic_artifacts(
-                repo_url=job.repo_url,
-                resolved_commit=resolved_commit,
-                job_id=job.job_id or "unknown",
-                repo_index=repo_index,
-                files_read=files_read,
-                files_not_read=files_not_read,
-                file_contents_map=state.get("file_contents_map", {}),
-            )
-        except Pass2SemanticError as e:
-            raw_text = getattr(e, "raw_text", None)
-            repaired_text = getattr(e, "repaired_text", None)
+        # NEW Pass2 API (pass2_semantic.py)
+        pass2_out = generate_pass2_semantic_artifacts(
+            repo_dir=state["repo_dir"],
+            job=job,
+            out_dir=Path(state["out_dir"]),
+            pass1_repo_index=repo_index,
+            repo_url=job.repo_url,
+        )
 
-            raw_path = lp.get("pass2_llm_raw_output") or str(Path(state["out_dir"]) / "PASS2_LLM_RAW_OUTPUT.txt")
-            repaired_path = lp.get("pass2_llm_repaired_output") or str(
-                Path(state["out_dir"]) / "PASS2_LLM_REPAIRED_OUTPUT.txt"
-            )
+        pass2_semantic = pass2_out.get("pass2_semantic", {}) if isinstance(pass2_out, dict) else {}
+        llm_out = pass2_semantic.get("llm_output", {}) if isinstance(pass2_semantic, dict) else {}
+        if not isinstance(llm_out, dict):
+            llm_out = {}
 
-            try:
-                if isinstance(raw_text, str) and raw_text:
-                    Path(raw_path).write_text(raw_text, encoding="utf-8")
-                if isinstance(repaired_text, str) and repaired_text:
-                    Path(repaired_path).write_text(repaired_text, encoding="utf-8")
-            except Exception:
-                pass
+        # Adapter: keep downstream artifacts stable enough for now.
+        arch_raw = llm_out
 
-            msg = f"pass2_semantic failed: {e}"
-            if isinstance(raw_text, str) and raw_text:
-                msg += f"\nRaw LLM output saved at: {raw_path}"
-            if isinstance(repaired_text, str) and repaired_text:
-                msg += f"\nRepaired LLM output saved at: {repaired_path}"
-            raise RuntimeError(msg) from e
+        summary = llm_out.get("summary", {}) if isinstance(llm_out.get("summary"), dict) else {}
+        gaps_raw = {
+            "source": "pass2_semantic.llm_output.summary",
+            "risks_or_gaps": summary.get("risks_or_gaps", []) if isinstance(summary.get("risks_or_gaps"), list) else [],
+        }
+
+        # ONBOARDING.md: lightweight onboarding from the same summary.
+        lines: list[str] = []
+        lines.append(f"# Onboarding\n")
+        primary_stack = summary.get("primary_stack")
+        if isinstance(primary_stack, str) and primary_stack.strip():
+            lines.append(f"**Primary stack:** {primary_stack.strip()}\n")
+
+        overview = summary.get("architecture_overview")
+        if isinstance(overview, str) and overview.strip():
+            lines.append("## Overview\n")
+            lines.append(overview.strip() + "\n")
+
+        key_components = summary.get("key_components")
+        if isinstance(key_components, list) and key_components:
+            lines.append("## Key components\n")
+            for x in key_components:
+                if isinstance(x, str) and x.strip():
+                    lines.append(f"- {x.strip()}")
+            lines.append("")
+
+        data_flows = summary.get("data_flows")
+        if isinstance(data_flows, list) and data_flows:
+            lines.append("## Data flows\n")
+            for x in data_flows:
+                if isinstance(x, str) and x.strip():
+                    lines.append(f"- {x.strip()}")
+            lines.append("")
+
+        auth_notes = summary.get("auth_and_routing_notes")
+        if isinstance(auth_notes, list) and auth_notes:
+            lines.append("## Auth and routing notes\n")
+            for x in auth_notes:
+                if isinstance(x, str) and x.strip():
+                    lines.append(f"- {x.strip()}")
+            lines.append("")
+
+        onboarding_md = "\n".join(lines).strip() + "\n"
 
         arch = _normalize_architecture_snapshot(
             arch=arch_raw,
@@ -821,7 +859,7 @@ def node_pass2_generate_outputs(state: SnapshotterState) -> SnapshotterState:
 
         write_json(lp["architecture_snapshot"], arch)
         write_json(lp["gaps"], gaps_raw)
-        Path(lp["onboarding"]).write_text(onboarding_md or "", encoding="utf-8")
+        Path(lp["onboarding"]).write_text(onboarding_md, encoding="utf-8")
 
         state["stage"] = stage
         return state
@@ -838,16 +876,7 @@ def node_pass1_manifest(state: SnapshotterState) -> SnapshotterState:
         _require_file(Path(lp["pass1_repo_index"]), label="PASS1_REPO_INDEX")
         _require_file(Path(lp["dependency_graph"]), label="DEPENDENCY_GRAPH")
 
-        manifest = build_artifact_manifest(
-            {
-                "pass1_repo_index": lp["pass1_repo_index"],
-                "dependency_graph": lp["dependency_graph"],
-                "repo_index": lp["repo_index"],  # convenience alias (may be useful for humans/tools)
-                "architecture_snapshot": lp["architecture_snapshot"],
-                "gaps": lp["gaps"],
-                "onboarding": lp["onboarding"],
-            }
-        )
+        manifest = build_artifact_manifest(lp)
         write_json(lp["artifact_manifest"], manifest)
         state["stage"] = stage
         return state
@@ -858,20 +887,8 @@ def node_pass1_manifest(state: SnapshotterState) -> SnapshotterState:
 def node_validate_basic(state: SnapshotterState) -> SnapshotterState:
     stage = STAGE_VALIDATE_BASIC
     try:
-        lp = state["local_paths"]
-
-        # LOCKED CONTRACT: dependency_graph is required.
-        validate_basic_artifacts(
-            {
-                "pass1_repo_index": lp["pass1_repo_index"],
-                "dependency_graph": lp["dependency_graph"],
-                "repo_index": lp["repo_index"],  # alias, allowed
-                "artifact_manifest": lp["artifact_manifest"],
-                "architecture_snapshot": lp["architecture_snapshot"],
-                "gaps": lp["gaps"],
-                "onboarding": lp["onboarding"],
-            }
-        )
+        validation_paths = get_validation_paths(state["local_paths"])
+        validate_basic_artifacts(validation_paths)
         state["stage"] = stage
         return state
     except Exception as e:
@@ -892,24 +909,31 @@ def node_upload_artifacts(state: SnapshotterState) -> SnapshotterState:
             state["s3_paths"] = {}
             return state
 
-        # Upload canonical + useful convenience artifacts.
-        s3_paths: dict[str, Optional[str]] = {
-            "pass1_repo_index": uploader.upload_file(
-                Path(lp["pass1_repo_index"]).name, lp["pass1_repo_index"], content_type="application/json"
-            ),
-            "dependency_graph": uploader.upload_file(
-                Path(lp["dependency_graph"]).name, lp["dependency_graph"], content_type="application/json"
-            ),
-            "repo_index": uploader.upload_file("repo_index.json", lp["repo_index"], content_type="application/json"),
-            "artifact_manifest": uploader.upload_file(
-                "artifact_manifest.json", lp["artifact_manifest"], content_type="application/json"
-            ),
-            "architecture_snapshot": uploader.upload_file(
-                "ARCHITECTURE_SUMMARY_SNAPSHOT.json", lp["architecture_snapshot"], content_type="application/json"
-            ),
-            "gaps": uploader.upload_file("GAPS_AND_INCONSISTENCIES.json", lp["gaps"], content_type="application/json"),
-            "onboarding": uploader.upload_file("ONBOARDING.md", lp["onboarding"], content_type="text/markdown"),
-        }
+        # Upload all artifacts defined in local_paths (except debug/raw files)
+        upload_candidates = [
+            "pass1_repo_index",
+            "dependency_graph",
+            "repo_index",
+            "artifact_manifest",
+            "architecture_snapshot",
+            "gaps",
+            "onboarding",
+            "pass2_semantic",
+            "pass2_arch_pack",
+            "pass2_support_pack",
+        ]
+
+        s3_paths: dict[str, Optional[str]] = {}
+        for key in upload_candidates:
+            path = lp.get(key)
+            if not path:
+                continue
+            p = Path(path)
+            if not p.exists():
+                continue
+
+            content_type = "application/json" if p.suffix == ".json" else "text/markdown"
+            s3_paths[key] = uploader.upload_file(p.name, path, content_type=content_type)
 
         state["stage"] = stage
         state["s3_paths"] = s3_paths
@@ -939,15 +963,7 @@ def node_emit_result(state: SnapshotterState) -> SnapshotterState:
                 "s3_bucket": job.output.s3_bucket,
                 "s3_prefix": job.s3_job_prefix(),
                 "job_payload_source": state.get("payload_src", "unknown"),
-                "artifacts": {
-                    "pass1_repo_index_local": lp["pass1_repo_index"],
-                    "dependency_graph_local": lp["dependency_graph"],
-                    "repo_index_local": lp["repo_index"],
-                    "artifact_manifest_local": lp["artifact_manifest"],
-                    "architecture_snapshot_local": lp["architecture_snapshot"],
-                    "gaps_local": lp["gaps"],
-                    "onboarding_local": lp["onboarding"],
-                },
+                "artifacts_local": lp,  # Include ALL local paths
                 "hashes": {"repo_index_sha256": repo_index_sha},
             }
             state["stage"] = stage
@@ -964,15 +980,8 @@ def node_emit_result(state: SnapshotterState) -> SnapshotterState:
             "s3_bucket": job.output.s3_bucket,
             "s3_prefix": job.s3_job_prefix(),
             "job_payload_source": state.get("payload_src", "unknown"),
-            "artifacts": {
-                "pass1_repo_index": s3p.get("pass1_repo_index"),
-                "dependency_graph": s3p.get("dependency_graph"),
-                "repo_index": s3p.get("repo_index"),
-                "artifact_manifest": s3p.get("artifact_manifest"),
-                "architecture_snapshot": s3p.get("architecture_snapshot"),
-                "gaps": s3p.get("gaps"),
-                "onboarding": s3p.get("onboarding"),
-            },
+            "artifacts_s3": s3p,
+            "artifacts_local": lp,
             "hashes": {"repo_index_sha256": repo_index_sha},
         }
         state["stage"] = stage
