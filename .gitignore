@@ -77,3 +77,4 @@ env/
 *.env
 
 .output.txt
+COMMIT_MSG.txt
